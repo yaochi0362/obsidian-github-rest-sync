@@ -70,11 +70,6 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 	return bytes.buffer;
 }
 
-// GitHub Contents API 的路徑要逐段 encode，斜線本身不能被 encode 掉
-function encodeRepoPath(path: string): string {
-	return path.split("/").map(encodeURIComponent).join("/");
-}
-
 async function gitBlobSha1(bytes: ArrayBuffer): Promise<string> {
 	const header = new TextEncoder().encode(`blob ${bytes.byteLength}\0`);
 	const combined = new Uint8Array(header.byteLength + bytes.byteLength);
@@ -324,24 +319,99 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
-	private async putFileToGithub(path: string, bytes: ArrayBuffer): Promise<void> {
+	private repoApiBase(): string {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
 		if (!parsed) throw new Error("Repository 網址格式無法解析");
-		const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/contents/${encodeRepoPath(path)}`;
+		return `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`;
+	}
+
+	private async githubJson<T>(url: string, method: string, body?: unknown): Promise<{ status: number; json: T; text: string }> {
 		const res = await requestUrl({
 			url,
-			method: "PUT",
+			method,
 			headers: { ...this.githubHeaders(), "Content-Type": "application/json" },
 			throw: false,
-			body: JSON.stringify({
-				message: `Multi-Device Sync: add ${path}`,
-				content: arrayBufferToBase64(bytes),
-				branch: this.settings.branch,
-			}),
+			body: body !== undefined ? JSON.stringify(body) : undefined,
 		});
-		if (res.status !== 200 && res.status !== 201) {
-			throw new Error(`推送失敗 (${res.status})：${res.text}`);
+		return { status: res.status, json: res.json as T, text: res.text };
+	}
+
+	// 讀取目前 branch 指向的 commit/tree sha，當作批次推送的 base_tree。
+	// repo 還沒有任何 commit 時（全新 repo）ref 不存在，回傳 null，之後改用「建立第一個 commit」的流程。
+	private async getBranchHead(): Promise<{ commitSha: string; treeSha: string } | null> {
+		const refRes = await this.githubJson<{ object: { sha: string } }>(
+			`${this.repoApiBase()}/git/refs/heads/${encodeURIComponent(this.settings.branch)}`,
+			"GET",
+		);
+		if (refRes.status === 404) return null;
+		if (refRes.status !== 200) throw new Error(`取得 branch 資訊失敗 (${refRes.status}): ${refRes.text}`);
+		const commitSha = refRes.json.object.sha;
+
+		const commitRes = await this.githubJson<{ tree: { sha: string } }>(`${this.repoApiBase()}/git/commits/${commitSha}`, "GET");
+		if (commitRes.status !== 200) throw new Error(`取得 commit 資訊失敗 (${commitRes.status}): ${commitRes.text}`);
+		return { commitSha, treeSha: commitRes.json.tree.sha };
+	}
+
+	private decodeAsUtf8IfPossible(bytes: ArrayBuffer): string | null {
+		try {
+			return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		} catch {
+			return null;
 		}
+	}
+
+	// 文字檔直接把內容塞進 tree entry（GitHub 會自動幫你建 blob），
+	// 二進位檔（圖片、PDF 等）才需要先呼叫 blobs API 拿 sha。
+	private async buildTreeEntry(path: string): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string }> {
+		const bytes = await this.app.vault.adapter.readBinary(path);
+		const text = this.decodeAsUtf8IfPossible(bytes);
+		if (text !== null) {
+			return { path, mode: "100644", type: "blob", content: text };
+		}
+		const blobRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/blobs`, "POST", {
+			content: arrayBufferToBase64(bytes),
+			encoding: "base64",
+		});
+		if (blobRes.status !== 201) throw new Error(`建立 blob 失敗 (${blobRes.status}): ${blobRes.text}`);
+		return { path, mode: "100644", type: "blob", sha: blobRes.json.sha };
+	}
+
+	// 把一批檔案打包成「一個」commit：建 tree（掛在 base_tree 上）→ 建 commit → 更新 branch ref。
+	// 回傳新的 commit/tree sha，供下一批接續使用（每批之後都要 fast-forward，不然下一批的 base_tree 會過時）。
+	private async commitBatch(
+		paths: string[],
+		base: { commitSha: string; treeSha: string } | null,
+	): Promise<{ commitSha: string; treeSha: string }> {
+		const entries = [];
+		for (const path of paths) {
+			entries.push(await this.buildTreeEntry(path));
+		}
+
+		const treeRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/trees`, "POST", {
+			tree: entries,
+			...(base ? { base_tree: base.treeSha } : {}),
+		});
+		if (treeRes.status !== 201) throw new Error(`建立 tree 失敗 (${treeRes.status}): ${treeRes.text}`);
+		const newTreeSha = treeRes.json.sha;
+
+		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
+			message: `Multi-Device Sync: add ${paths.length} files`,
+			tree: newTreeSha,
+			...(base ? { parents: [base.commitSha] } : {}),
+		});
+		if (commitRes.status !== 201) throw new Error(`建立 commit 失敗 (${commitRes.status}): ${commitRes.text}`);
+		const newCommitSha = commitRes.json.sha;
+
+		const refUrl = base
+			? `${this.repoApiBase()}/git/refs/heads/${encodeURIComponent(this.settings.branch)}`
+			: `${this.repoApiBase()}/git/refs`;
+		const refBody = base ? { sha: newCommitSha } : { ref: `refs/heads/${this.settings.branch}`, sha: newCommitSha };
+		const refRes = await this.githubJson(refUrl, base ? "PATCH" : "POST", refBody);
+		if (refRes.status !== 200 && refRes.status !== 201) {
+			throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
+		}
+
+		return { commitSha: newCommitSha, treeSha: newTreeSha };
 	}
 
 	async runDryRun() {
@@ -403,6 +473,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	async pushNewFiles() {
 		if (!this.checkConfigured()) return;
 
+		const PUSH_BATCH_SIZE = 200;
 		new Notice("比對中…");
 		try {
 			const { result } = await this.computeDiffNow();
@@ -412,23 +483,23 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				return;
 			}
 
-			new Notice(`開始推送 ${result.onlyLocal.length} 個新檔案…`);
+			const batches: string[][] = [];
+			for (let i = 0; i < result.onlyLocal.length; i += PUSH_BATCH_SIZE) {
+				batches.push(result.onlyLocal.slice(i, i + PUSH_BATCH_SIZE));
+			}
+			new Notice(`開始推送 ${result.onlyLocal.length} 個新檔案，分 ${batches.length} 個 commit…`);
+
+			let head = await this.getBranchHead();
 			let done = 0;
-			let failed = 0;
-			for (const path of result.onlyLocal) {
-				try {
-					const bytes = await this.app.vault.adapter.readBinary(path);
-					await this.putFileToGithub(path, bytes);
-					done++;
-				} catch (error) {
-					failed++;
-					console.error(`[multi-device-sync] push failed for ${path}`, error);
-				}
+			for (const batch of batches) {
+				head = await this.commitBatch(batch, head);
+				done += batch.length;
+				new Notice(`已推送 ${done}/${result.onlyLocal.length}`);
 			}
 
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
-			new Notice(`推送完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`);
+			new Notice(`推送完成：${done} 個檔案，共 ${batches.length} 個 commit`);
 		} catch (error) {
 			console.error("[multi-device-sync] push failed", error);
 			new Notice(`推送失敗：${error instanceof Error ? error.message : String(error)}`);
