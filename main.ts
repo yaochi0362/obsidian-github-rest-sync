@@ -25,6 +25,7 @@ function ensureSpinnerStyle() {
 
 class ProgressModal extends Modal {
 	private messageEl: HTMLElement;
+	private allowClose = false;
 
 	constructor(
 		app: App,
@@ -39,10 +40,28 @@ class ProgressModal extends Modal {
 		this.contentEl.createDiv({ cls: "mds-spinner" });
 		this.messageEl = this.contentEl.createEl("div", { text: "準備中…" });
 		this.messageEl.style.textAlign = "center";
+		this.contentEl.createEl("div", {
+			text: "進行中，請勿關閉此視窗",
+			cls: "setting-item-description",
+		}).style.textAlign = "center";
+		// 拿掉右上角關閉鈕，避免誤觸——背景其實不會被中斷，但會讓人失去進度可見度、誤以為取消了
+		this.modalEl.querySelector(".modal-close-button")?.remove();
 	}
 
 	setMessage(text: string) {
 		this.messageEl?.setText(text);
+	}
+
+	// 操作真正完成時呼叫這個，而不是 close()——點擊背景遮罩也會呼叫 close()，
+	// 覆寫掉它讓進行中無法被關閉。
+	finish() {
+		this.allowClose = true;
+		this.close();
+	}
+
+	close() {
+		if (!this.allowClose) return;
+		super.close();
 	}
 }
 
@@ -149,7 +168,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			console.error(`[multi-device-sync] ${title} failed`, error);
 			new Notice(`${title}失敗：${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			modal.close();
+			modal.finish();
 			this.syncing = false;
 		}
 	}
