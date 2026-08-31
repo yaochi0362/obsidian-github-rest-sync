@@ -94,6 +94,38 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	async testConnection() {
+		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
+		if (!parsed) {
+			new Notice("⚠️ Repository 網址無法解析，請檢查格式");
+			return;
+		}
+		if (!this.settings.token) {
+			new Notice("⚠️ 還沒填 token");
+			return;
+		}
+
+		new Notice("測試連線中…");
+		try {
+			const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`;
+			const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
+			if (res.status === 200) {
+				const data = res.json as { default_branch: string; private: boolean };
+				new Notice(
+					`✅ 連線成功：${parsed.owner}/${parsed.repo}（${data.private ? "private" : "public"}，預設 branch: ${data.default_branch}）`,
+				);
+			} else if (res.status === 401) {
+				new Notice("❌ Token 無效或已過期 (401)");
+			} else if (res.status === 404) {
+				new Notice("❌ 找不到這個 repo，或 token 沒有存取權限 (404)");
+			} else {
+				new Notice(`❌ 連線失敗 (${res.status})：${res.text}`);
+			}
+		} catch (error) {
+			new Notice(`❌ 連線失敗：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	private githubHeaders(): Record<string, string> {
 		return {
 			Authorization: `Bearer ${this.settings.token}`,
@@ -258,5 +290,14 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				});
 			});
+
+		new Setting(containerEl)
+			.setName("測試連線")
+			.setDesc("驗證上面填的網址跟 token 能不能正確存取這個 repo")
+			.addButton((button) =>
+				button.setButtonText("測試").onClick(async () => {
+					await this.plugin.testConnection();
+				}),
+			);
 	}
 }
