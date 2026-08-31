@@ -65,6 +65,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 		this.addSettingTab(new MultiDeviceSyncSettingTab(this.app, this));
 
+		this.addRibbonIcon("refresh-cw", "Multi-Device Sync：比對雲端與本機差異", () => {
+			this.runDryRun();
+		});
+
 		this.addCommand({
 			id: "multi-device-sync-ping",
 			name: "Multi-Device Sync: 測試安裝是否成功",
