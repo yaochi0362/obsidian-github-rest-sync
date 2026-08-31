@@ -99,6 +99,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			this.runDryRun();
 		});
 
+		this.addRibbonIcon("download", "Multi-Device Sync：拉取只在 GitHub 上的新檔案", () => {
+			this.pullNewFiles();
+		});
+
+		this.addRibbonIcon("upload", "Multi-Device Sync：推送只在本機的新檔案", () => {
+			this.pushNewFiles();
+		});
+
 		this.addCommand({
 			id: "multi-device-sync-ping",
 			name: "Multi-Device Sync: 測試安裝是否成功",
