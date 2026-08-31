@@ -1,18 +1,28 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, requestUrl, normalizePath } from "obsidian";
 
 interface MultiDeviceSyncSettings {
-	owner: string;
-	repo: string;
+	repoUrl: string;
 	branch: string;
 	token: string;
 }
 
 const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
-	owner: "",
-	repo: "",
+	repoUrl: "",
 	branch: "main",
 	token: "",
 };
+
+interface ParsedRepo {
+	owner: string;
+	repo: string;
+}
+
+// 支援 https://github.com/owner/repo、.git 結尾、尾端斜線、以及 git@github.com:owner/repo.git 格式
+function parseGithubRepoUrl(url: string): ParsedRepo | null {
+	const match = url.trim().match(/github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+	if (!match) return null;
+	return { owner: match[1], repo: match[2] };
+}
 
 // 目前不同步的路徑前綴：裝置各自的 Obsidian 設定/暫存
 const EXCLUDED_PREFIXES = [".obsidian/", ".git/", ".trash/"];
@@ -92,7 +102,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	}
 
 	private async fetchRemoteTree(): Promise<GitTreeEntry[]> {
-		const { owner, repo, branch } = this.settings;
+		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
+		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		const { owner, repo } = parsed;
+		const { branch } = this.settings;
 		const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
 		const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
 		if (res.status !== 200) {
@@ -165,8 +178,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	}
 
 	async runDryRun() {
-		if (!this.settings.owner || !this.settings.repo || !this.settings.token) {
-			new Notice("請先到 Multi-Device Sync 設定頁填好 owner / repo / token");
+		if (!parseGithubRepoUrl(this.settings.repoUrl) || !this.settings.token) {
+			new Notice("請先到 Multi-Device Sync 設定頁填好 repository 網址 / token");
 			return;
 		}
 
@@ -202,24 +215,28 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName("GitHub owner")
-			.setDesc("例如 yaochi0362")
+			.setName("Repository 網址")
+			.setDesc("直接貼 GitHub 網址，例如 https://github.com/yaochi0362/YCObsidian")
 			.addText((text) =>
-				text.setValue(this.plugin.settings.owner).onChange(async (value) => {
-					this.plugin.settings.owner = value.trim();
+				text.setValue(this.plugin.settings.repoUrl).onChange(async (value) => {
+					this.plugin.settings.repoUrl = value.trim();
 					await this.plugin.saveSettings();
+					updateParsedDisplay();
 				}),
 			);
 
-		new Setting(containerEl)
-			.setName("Repository")
-			.setDesc("例如 YCObsidian")
-			.addText((text) =>
-				text.setValue(this.plugin.settings.repo).onChange(async (value) => {
-					this.plugin.settings.repo = value.trim();
-					await this.plugin.saveSettings();
-				}),
-			);
+		const parsedDisplay = containerEl.createEl("div", { cls: "setting-item-description" });
+		const updateParsedDisplay = () => {
+			const parsed = parseGithubRepoUrl(this.plugin.settings.repoUrl);
+			if (!this.plugin.settings.repoUrl) {
+				parsedDisplay.setText("");
+			} else if (parsed) {
+				parsedDisplay.setText(`✅ Owner: ${parsed.owner}　Repo: ${parsed.repo}`);
+			} else {
+				parsedDisplay.setText("⚠️ 無法從這個網址解析出 owner/repo，請確認格式");
+			}
+		};
+		updateParsedDisplay();
 
 		new Setting(containerEl)
 			.setName("Branch")
