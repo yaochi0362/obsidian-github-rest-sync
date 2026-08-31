@@ -51,6 +51,30 @@ function isExcluded(path: string): boolean {
 	return EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
+function arrayBufferToBase64(bytes: ArrayBuffer): string {
+	const uint8 = new Uint8Array(bytes);
+	let binary = "";
+	const chunkSize = 0x8000; // 避免大檔案一次 apply 太多參數炸掉呼叫堆疊
+	for (let i = 0; i < uint8.length; i += chunkSize) {
+		binary += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
+	}
+	return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+	const binary = atob(base64.replace(/\n/g, ""));
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes.buffer;
+}
+
+// GitHub Contents API 的路徑要逐段 encode，斜線本身不能被 encode 掉
+function encodeRepoPath(path: string): string {
+	return path.split("/").map(encodeURIComponent).join("/");
+}
+
 async function gitBlobSha1(bytes: ArrayBuffer): Promise<string> {
 	const header = new TextEncoder().encode(`blob ${bytes.byteLength}\0`);
 	const combined = new Uint8Array(header.byteLength + bytes.byteLength);
@@ -87,6 +111,18 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			id: "multi-device-sync-dry-run",
 			name: "Multi-Device Sync: 比對雲端與本機差異（不會寫入任何檔案）",
 			callback: () => this.runDryRun(),
+		});
+
+		this.addCommand({
+			id: "multi-device-sync-pull-new",
+			name: "Multi-Device Sync: 拉取只在 GitHub 上的新檔案",
+			callback: () => this.pullNewFiles(),
+		});
+
+		this.addCommand({
+			id: "multi-device-sync-push-new",
+			name: "Multi-Device Sync: 推送只在本機的新檔案",
+			callback: () => this.pushNewFiles(),
 		});
 
 		new Notice("Multi-Device Sync 已載入");
@@ -241,20 +277,72 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		].join("\n");
 	}
 
-	async runDryRun() {
+	private checkConfigured(): boolean {
 		if (!parseGithubRepoUrl(this.settings.repoUrl) || !this.settings.token) {
 			new Notice("請先到 Multi-Device Sync 設定頁填好 repository 網址 / token");
-			return;
+			return false;
 		}
+		return true;
+	}
+
+	private async computeDiffNow(): Promise<{ remoteTree: GitTreeEntry[]; result: DiffResult }> {
+		const [remoteTree, localShas] = await Promise.all([this.fetchRemoteTree(), this.computeLocalShas()]);
+		const result = this.diff(remoteTree, localShas);
+		return { remoteTree, result };
+	}
+
+	private async writeReport(result: DiffResult) {
+		const report = this.buildReportMarkdown(result);
+		await this.app.vault.adapter.write(normalizePath("多裝置同步報告.md"), report);
+	}
+
+	private async fetchBlobContent(sha: string): Promise<ArrayBuffer> {
+		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
+		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/blobs/${sha}`;
+		const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
+		if (res.status !== 200) {
+			throw new Error(`抓取檔案內容失敗 (${res.status}): ${res.text}`);
+		}
+		const data = res.json as { content: string; encoding: string };
+		return base64ToArrayBuffer(data.content);
+	}
+
+	private async ensureParentFolder(filePath: string): Promise<void> {
+		const folderPath = filePath.split("/").slice(0, -1).join("/");
+		if (!folderPath) return;
+		if (!(await this.app.vault.adapter.exists(folderPath))) {
+			await this.app.vault.adapter.mkdir(folderPath);
+		}
+	}
+
+	private async putFileToGithub(path: string, bytes: ArrayBuffer): Promise<void> {
+		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
+		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/contents/${encodeRepoPath(path)}`;
+		const res = await requestUrl({
+			url,
+			method: "PUT",
+			headers: { ...this.githubHeaders(), "Content-Type": "application/json" },
+			throw: false,
+			body: JSON.stringify({
+				message: `Multi-Device Sync: add ${path}`,
+				content: arrayBufferToBase64(bytes),
+				branch: this.settings.branch,
+			}),
+		});
+		if (res.status !== 200 && res.status !== 201) {
+			throw new Error(`推送失敗 (${res.status})：${res.text}`);
+		}
+	}
+
+	async runDryRun() {
+		if (!this.checkConfigured()) return;
 
 		new Notice("開始比對，請稍候…");
 		try {
-			const [remoteTree, localShas] = await Promise.all([this.fetchRemoteTree(), this.computeLocalShas()]);
-			const result = this.diff(remoteTree, localShas);
-			const report = this.buildReportMarkdown(result);
-
-			const reportPath = normalizePath("多裝置同步報告.md");
-			await this.app.vault.adapter.write(reportPath, report);
+			const { result } = await this.computeDiffNow();
+			await this.writeReport(result);
 
 			new Notice(
 				`比對完成：一致 ${result.inSyncCount}、只在本機 ${result.onlyLocal.length}、只在雲端 ${result.onlyRemote.length}、內容不同 ${result.differs.length}。詳情請看「多裝置同步報告」筆記`,
@@ -262,6 +350,80 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		} catch (error) {
 			console.error("[multi-device-sync] dry run failed", error);
 			new Notice(`比對失敗：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	async pullNewFiles() {
+		if (!this.checkConfigured()) return;
+
+		new Notice("比對中…");
+		try {
+			const { remoteTree, result } = await this.computeDiffNow();
+			if (result.onlyRemote.length === 0) {
+				new Notice("沒有需要拉取的新檔案");
+				await this.writeReport(result);
+				return;
+			}
+
+			new Notice(`開始拉取 ${result.onlyRemote.length} 個新檔案…`);
+			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
+			let done = 0;
+			let failed = 0;
+			for (const path of result.onlyRemote) {
+				try {
+					const sha = shaByPath.get(path);
+					if (!sha) continue;
+					const bytes = await this.fetchBlobContent(sha);
+					await this.ensureParentFolder(path);
+					await this.app.vault.adapter.writeBinary(path, bytes);
+					done++;
+				} catch (error) {
+					failed++;
+					console.error(`[multi-device-sync] pull failed for ${path}`, error);
+				}
+			}
+
+			const { result: finalResult } = await this.computeDiffNow();
+			await this.writeReport(finalResult);
+			new Notice(`拉取完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`);
+		} catch (error) {
+			console.error("[multi-device-sync] pull failed", error);
+			new Notice(`拉取失敗：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	async pushNewFiles() {
+		if (!this.checkConfigured()) return;
+
+		new Notice("比對中…");
+		try {
+			const { result } = await this.computeDiffNow();
+			if (result.onlyLocal.length === 0) {
+				new Notice("沒有需要推送的新檔案");
+				await this.writeReport(result);
+				return;
+			}
+
+			new Notice(`開始推送 ${result.onlyLocal.length} 個新檔案…`);
+			let done = 0;
+			let failed = 0;
+			for (const path of result.onlyLocal) {
+				try {
+					const bytes = await this.app.vault.adapter.readBinary(path);
+					await this.putFileToGithub(path, bytes);
+					done++;
+				} catch (error) {
+					failed++;
+					console.error(`[multi-device-sync] push failed for ${path}`, error);
+				}
+			}
+
+			const { result: finalResult } = await this.computeDiffNow();
+			await this.writeReport(finalResult);
+			new Notice(`推送完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`);
+		} catch (error) {
+			console.error("[multi-device-sync] push failed", error);
+			new Notice(`推送失敗：${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 }
