@@ -1,6 +1,6 @@
 {
-	"id": "yc-vault-sync",
-	"name": "YC Vault Sync",
+	"id": "multi-device-sync",
+	"name": "Multi-Device Sync",
 	"version": "0.0.1",
 	"minAppVersion": "1.4.16",
 	"description": "Sync this vault with a GitHub repo via the REST API (no Node/git dependencies, mobile-safe).",

@@ -1,21 +1,21 @@
 import { Notice, Plugin } from "obsidian";
 
-export default class YcVaultSyncPlugin extends Plugin {
+export default class MultiDeviceSyncPlugin extends Plugin {
 	async onload() {
-		console.log("[yc-vault-sync] plugin loaded");
+		console.log("[multi-device-sync] plugin loaded");
 
 		this.addCommand({
-			id: "yc-vault-sync-ping",
-			name: "YC Vault Sync: 測試安裝是否成功",
+			id: "multi-device-sync-ping",
+			name: "Multi-Device Sync: 測試安裝是否成功",
 			callback: () => {
-				new Notice("YC Vault Sync 安裝成功 ✅");
+				new Notice("Multi-Device Sync 安裝成功 ✅");
 			},
 		});
 
-		new Notice("YC Vault Sync 已載入");
+		new Notice("Multi-Device Sync 已載入");
 	}
 
 	onunload() {
-		console.log("[yc-vault-sync] plugin unloaded");
+		console.log("[multi-device-sync] plugin unloaded");
 	}
 }
