@@ -1,4 +1,50 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, requestUrl, normalizePath } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl, normalizePath } from "obsidian";
+
+const SPINNER_STYLE_ID = "multi-device-sync-spinner-style";
+
+function ensureSpinnerStyle() {
+	if (document.getElementById(SPINNER_STYLE_ID)) return;
+	const style = document.createElement("style");
+	style.id = SPINNER_STYLE_ID;
+	style.textContent = `
+		.mds-spinner {
+			width: 28px;
+			height: 28px;
+			border-radius: 50%;
+			border: 3px solid var(--background-modifier-border);
+			border-top-color: var(--interactive-accent);
+			animation: mds-spin 0.8s linear infinite;
+			margin: 0 auto 12px;
+		}
+		@keyframes mds-spin {
+			to { transform: rotate(360deg); }
+		}
+	`;
+	document.head.appendChild(style);
+}
+
+class ProgressModal extends Modal {
+	private messageEl: HTMLElement;
+
+	constructor(
+		app: App,
+		private title: string,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		ensureSpinnerStyle();
+		this.titleEl.setText(this.title);
+		this.contentEl.createDiv({ cls: "mds-spinner" });
+		this.messageEl = this.contentEl.createEl("div", { text: "準備中…" });
+		this.messageEl.style.textAlign = "center";
+	}
+
+	setMessage(text: string) {
+		this.messageEl?.setText(text);
+	}
+}
 
 interface MultiDeviceSyncSettings {
 	repoUrl: string;
@@ -83,6 +129,30 @@ async function gitBlobSha1(bytes: ArrayBuffer): Promise<string> {
 
 export default class MultiDeviceSyncPlugin extends Plugin {
 	settings: MultiDeviceSyncSettings;
+	private syncing = false;
+
+	// 統一入口：擋掉重疊執行（同一個 batch push 跑到一半又被點一次，
+	// 兩邊各自 fast-forward branch 會互相踩到），並常駐一個進度視窗，
+	// 過程中只更新視窗文字，不再連續跳好幾個 Notice。
+	private async withProgress(title: string, fn: (modal: ProgressModal) => Promise<string>) {
+		if (this.syncing) {
+			new Notice("已經有一個同步作業在執行中，請稍候");
+			return;
+		}
+		this.syncing = true;
+		const modal = new ProgressModal(this.app, title);
+		modal.open();
+		try {
+			const finalMessage = await fn(modal);
+			new Notice(finalMessage);
+		} catch (error) {
+			console.error(`[multi-device-sync] ${title} failed`, error);
+			new Notice(`${title}失敗：${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			modal.close();
+			this.syncing = false;
+		}
+	}
 
 	async onload() {
 		console.log("[multi-device-sync] plugin loaded");
@@ -381,6 +451,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private async commitBatch(
 		paths: string[],
 		base: { commitSha: string; treeSha: string } | null,
+		retriesLeft = 2,
 	): Promise<{ commitSha: string; treeSha: string }> {
 		const entries = [];
 		for (const path of paths) {
@@ -407,47 +478,51 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			: `${this.repoApiBase()}/git/refs`;
 		const refBody = base ? { sha: newCommitSha } : { ref: `refs/heads/${this.settings.branch}`, sha: newCommitSha };
 		const refRes = await this.githubJson(refUrl, base ? "PATCH" : "POST", refBody);
-		if (refRes.status !== 200 && refRes.status !== 201) {
-			throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
+
+		if (refRes.status === 200 || refRes.status === 201) {
+			return { commitSha: newCommitSha, treeSha: newTreeSha };
 		}
 
-		return { commitSha: newCommitSha, treeSha: newTreeSha };
+		// 422 (not a fast forward) / 409：branch 在我們讀取之後被別的東西動過
+		// （例如同一個操作被重複觸發、或另一台裝置也在同時推送）。
+		// 重新讀一次目前的 head，用新的 base 重做這批 tree+commit 再試一次。
+		if ((refRes.status === 422 || refRes.status === 409) && retriesLeft > 0) {
+			const freshBase = await this.getBranchHead();
+			return this.commitBatch(paths, freshBase, retriesLeft - 1);
+		}
+
+		throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
 	}
 
 	async runDryRun() {
 		if (!this.checkConfigured()) return;
 
-		new Notice("開始比對，請稍候…");
-		try {
+		await this.withProgress("比對雲端與本機差異", async (modal) => {
+			modal.setMessage("讀取本機與 GitHub 檔案清單…");
 			const { result } = await this.computeDiffNow();
+			modal.setMessage("寫入比對報告…");
 			await this.writeReport(result);
 
-			new Notice(
-				`比對完成：一致 ${result.inSyncCount}、只在本機 ${result.onlyLocal.length}、只在雲端 ${result.onlyRemote.length}、內容不同 ${result.differs.length}。詳情請看「多裝置同步報告」筆記`,
-			);
-		} catch (error) {
-			console.error("[multi-device-sync] dry run failed", error);
-			new Notice(`比對失敗：${error instanceof Error ? error.message : String(error)}`);
-		}
+			return `比對完成：一致 ${result.inSyncCount}、只在本機 ${result.onlyLocal.length}、只在雲端 ${result.onlyRemote.length}、內容不同 ${result.differs.length}。詳情請看「多裝置同步報告」筆記`;
+		});
 	}
 
 	async pullNewFiles() {
 		if (!this.checkConfigured()) return;
 
-		new Notice("比對中…");
-		try {
+		await this.withProgress("拉取新檔案", async (modal) => {
+			modal.setMessage("比對中…");
 			const { remoteTree, result } = await this.computeDiffNow();
 			if (result.onlyRemote.length === 0) {
-				new Notice("沒有需要拉取的新檔案");
 				await this.writeReport(result);
-				return;
+				return "沒有需要拉取的新檔案";
 			}
 
-			new Notice(`開始拉取 ${result.onlyRemote.length} 個新檔案…`);
 			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
 			let done = 0;
 			let failed = 0;
 			for (const path of result.onlyRemote) {
+				modal.setMessage(`拉取中… ${done + failed}/${result.onlyRemote.length}\n${path}`);
 				try {
 					const sha = shaByPath.get(path);
 					if (!sha) continue;
@@ -461,49 +536,43 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				}
 			}
 
+			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
-			new Notice(`拉取完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`);
-		} catch (error) {
-			console.error("[multi-device-sync] pull failed", error);
-			new Notice(`拉取失敗：${error instanceof Error ? error.message : String(error)}`);
-		}
+			return `拉取完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`;
+		});
 	}
 
 	async pushNewFiles() {
 		if (!this.checkConfigured()) return;
 
 		const PUSH_BATCH_SIZE = 200;
-		new Notice("比對中…");
-		try {
+		await this.withProgress("推送新檔案", async (modal) => {
+			modal.setMessage("比對中…");
 			const { result } = await this.computeDiffNow();
 			if (result.onlyLocal.length === 0) {
-				new Notice("沒有需要推送的新檔案");
 				await this.writeReport(result);
-				return;
+				return "沒有需要推送的新檔案";
 			}
 
 			const batches: string[][] = [];
 			for (let i = 0; i < result.onlyLocal.length; i += PUSH_BATCH_SIZE) {
 				batches.push(result.onlyLocal.slice(i, i + PUSH_BATCH_SIZE));
 			}
-			new Notice(`開始推送 ${result.onlyLocal.length} 個新檔案，分 ${batches.length} 個 commit…`);
 
 			let head = await this.getBranchHead();
 			let done = 0;
-			for (const batch of batches) {
-				head = await this.commitBatch(batch, head);
-				done += batch.length;
-				new Notice(`已推送 ${done}/${result.onlyLocal.length}`);
+			for (let i = 0; i < batches.length; i++) {
+				modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${result.onlyLocal.length} 個檔案）`);
+				head = await this.commitBatch(batches[i], head);
+				done += batches[i].length;
 			}
 
+			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
-			new Notice(`推送完成：${done} 個檔案，共 ${batches.length} 個 commit`);
-		} catch (error) {
-			console.error("[multi-device-sync] push failed", error);
-			new Notice(`推送失敗：${error instanceof Error ? error.message : String(error)}`);
-		}
+			return `推送完成：${done} 個檔案，共 ${batches.length} 個 commit`;
+		});
 	}
 }
 
