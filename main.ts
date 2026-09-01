@@ -631,7 +631,17 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			tree: entries,
 			...(base ? { base_tree: base.treeSha } : {}),
 		});
-		if (treeRes.status !== 201) throw new Error(`Failed to create tree (${treeRes.status}): ${treeRes.text}`);
+		if (treeRes.status !== 201) {
+			// 422 here (often "GitRPC::BadObjectState") usually means base_tree is stale - e.g. a
+			// delete entry no longer matches what's actually in the tree we're building on
+			// because the branch moved after we read it. Same fix as the ref-update race below:
+			// refetch the head and retry the whole batch against a fresh base.
+			if (treeRes.status === 422 && retriesLeft > 0) {
+				const freshBase = await this.getBranchHead();
+				return this.commitBatch(changes, freshBase, retriesLeft - 1);
+			}
+			throw new Error(`Failed to create tree (${treeRes.status}): ${treeRes.text}`);
+		}
 		const newTreeSha = treeRes.json.sha;
 
 		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
