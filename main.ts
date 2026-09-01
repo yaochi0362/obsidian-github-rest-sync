@@ -101,8 +101,12 @@ function looksLikeGithubToken(token: string): boolean {
 	return /^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{10,}$/.test(token);
 }
 
+const REPORT_FILE_PATH = normalizePath("多裝置同步報告.md");
+
 // 目前不同步的路徑前綴：裝置各自的 Obsidian 設定/暫存
 const EXCLUDED_PREFIXES = [".obsidian/", ".git/", ".trash/"];
+// 每次跑都會重新產生、內容一定會變的檔案：不列入比對，不然永遠會被判定成「內容不同」
+const EXCLUDED_PATHS = [REPORT_FILE_PATH];
 
 interface GitTreeEntry {
 	path: string;
@@ -126,7 +130,7 @@ interface DiffResult {
 }
 
 function isExcluded(path: string): boolean {
-	return EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix));
+	return EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix)) || EXCLUDED_PATHS.includes(path);
 }
 
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
@@ -426,7 +430,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private async writeReport(result: DiffResult) {
 		const report = this.buildReportMarkdown(result);
-		await this.app.vault.adapter.write(normalizePath("多裝置同步報告.md"), report);
+		await this.app.vault.adapter.write(REPORT_FILE_PATH, report);
 	}
 
 	private async fetchBlobContent(sha: string): Promise<ArrayBuffer> {
