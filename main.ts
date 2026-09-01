@@ -200,7 +200,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// BRAT 在手機上更新時，不一定會先正確卸載舊版本，導致舊版本註冊的 ribbon 項目
 	// 沒被清掉、每次改版都多疊一個。這裡不管上一輪乾不乾淨，都先主動清一次舊的。
 	private removeStaleRibbonIcons() {
-		document.querySelectorAll('[aria-label^="Multi-Device Sync"]').forEach((el) => el.remove());
+		document
+			.querySelectorAll('[aria-label^="Multi-Device Sync"], [aria-label^="GitHub REST Sync"]')
+			.forEach((el) => el.remove());
 	}
 
 	// 同樣道理，指令 id 曾經在不同版本被重複使用/移除過，直接用 app 內部 API 依 id 清掉，
@@ -225,21 +227,21 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 		this.addSettingTab(new MultiDeviceSyncSettingTab(this.app, this));
 
-		this.addRibbonIcon("refresh-cw", "Multi-Device Sync：一鍵同步", () => {
+		this.addRibbonIcon("refresh-cw", "GitHub REST Sync：一鍵同步", () => {
 			this.syncAll();
 		});
 
 		this.addCommand({
-			id: "multi-device-sync-ping",
-			name: "Multi-Device Sync: 測試安裝是否成功",
+			id: "github-rest-sync-ping",
+			name: "GitHub REST Sync: 測試安裝是否成功",
 			callback: () => {
-				new Notice("Multi-Device Sync 安裝成功 ✅");
+				new Notice("GitHub REST Sync 安裝成功 ✅");
 			},
 		});
 
 		this.addCommand({
-			id: "multi-device-sync-all",
-			name: "Multi-Device Sync: 一鍵同步（推送＋拉取）",
+			id: "github-rest-sync-all",
+			name: "GitHub REST Sync: 一鍵同步（推送＋拉取）",
 			callback: () => this.syncAll(),
 		});
 
@@ -267,7 +269,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			);
 		});
 
-		new Notice("Multi-Device Sync 已載入");
+		new Notice("GitHub REST Sync 已載入");
 	}
 
 	onunload() {
@@ -278,8 +280,28 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// 外掛 id 從 multi-device-sync 改名成 github-rest-sync 時，這裡是舊資料夾的路徑。
+	// 一次性搬移用：全新安裝（loadData 是空的）時，如果舊資料夾還留著設定檔，直接讀過來當初始值，
+	// 這樣改 id/資料夾名稱就不會把每台裝置的 syncState 同步歷史清空重來。
+	private static readonly OLD_PLUGIN_ID = "multi-device-sync";
+
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const currentData = await this.loadData();
+		if (!currentData) {
+			const oldDataPath = normalizePath(`.obsidian/plugins/${MultiDeviceSyncPlugin.OLD_PLUGIN_ID}/data.json`);
+			if (this.manifest.id !== MultiDeviceSyncPlugin.OLD_PLUGIN_ID && (await this.app.vault.adapter.exists(oldDataPath))) {
+				try {
+					const oldData = JSON.parse(await this.app.vault.adapter.read(oldDataPath));
+					this.settings = Object.assign({}, DEFAULT_SETTINGS, oldData);
+					await this.saveSettings();
+					new Notice("已從舊版外掛搬移設定與同步紀錄");
+					return;
+				} catch (error) {
+					console.error("[github-rest-sync] failed to migrate settings from old plugin folder", error);
+				}
+			}
+		}
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, currentData);
 	}
 
 	async saveSettings() {
@@ -464,7 +486,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private checkConfigured(): boolean {
 		if (!this.isConfigured()) {
-			new Notice("請先到 Multi-Device Sync 設定頁填好 repository 網址 / token");
+			new Notice("請先到 GitHub REST Sync 設定頁填好 repository 網址 / token");
 			return false;
 		}
 		return true;
@@ -598,7 +620,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const newTreeSha = treeRes.json.sha;
 
 		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
-			message: `Multi-Device Sync: sync ${changes.length} files`,
+			message: `GitHub REST Sync: sync ${changes.length} files`,
 			tree: newTreeSha,
 			...(base ? { parents: [base.commitSha] } : {}),
 		});
