@@ -597,6 +597,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	async pullChanges() {
 		if (!this.checkConfigured()) return;
 
+		const PULL_BATCH_SIZE = 20; // 每批平行抓取，批次之間依序，避免一次開太多平行請求
 		await this.withProgress("拉取變更", async (modal) => {
 			modal.setMessage("比對中…");
 			const { remoteTree, result } = await this.computeDiffNow();
@@ -606,30 +607,44 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			}
 
 			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-			let done = 0;
-			let failed = 0;
-			const succeeded: PlannedChange[] = [];
-			for (const change of result.toPull) {
-				modal.setMessage(`拉取中… ${done + failed}/${result.toPull.length}\n[${change.action}] ${change.path}`);
-				try {
-					if (change.action === "delete") {
-						await this.app.vault.adapter.remove(change.path);
-					} else {
-						const sha = shaByPath.get(change.path);
-						if (!sha) continue;
-						const bytes = await this.fetchBlobContent(sha);
-						await this.ensureParentFolder(change.path);
-						await this.app.vault.adapter.writeBinary(change.path, bytes);
-					}
-					succeeded.push(change);
-					done++;
-				} catch (error) {
-					failed++;
-					console.error(`[multi-device-sync] pull failed for ${change.path}`, error);
-				}
+			const batches: PlannedChange[][] = [];
+			for (let i = 0; i < result.toPull.length; i += PULL_BATCH_SIZE) {
+				batches.push(result.toPull.slice(i, i + PULL_BATCH_SIZE));
 			}
 
-			await this.recordSynced(succeeded, (path) => shaByPath.get(path));
+			let done = 0;
+			let failed = 0;
+			for (let i = 0; i < batches.length; i++) {
+				modal.setMessage(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${result.toPull.length} 個檔案）`);
+				const batch = batches[i];
+				const outcomes = await Promise.allSettled(
+					batch.map(async (change) => {
+						if (change.action === "delete") {
+							await this.app.vault.adapter.remove(change.path);
+						} else {
+							const sha = shaByPath.get(change.path);
+							if (!sha) throw new Error("找不到對應的 blob sha");
+							const bytes = await this.fetchBlobContent(sha);
+							await this.ensureParentFolder(change.path);
+							await this.app.vault.adapter.writeBinary(change.path, bytes);
+						}
+						return change;
+					}),
+				);
+
+				const succeeded: PlannedChange[] = [];
+				for (const outcome of outcomes) {
+					if (outcome.status === "fulfilled") {
+						succeeded.push(outcome.value);
+						done++;
+					} else {
+						failed++;
+						console.error("[multi-device-sync] pull failed", outcome.reason);
+					}
+				}
+				// 每批結束就存一次記錄——就算之後被中斷，這批已經成功的也不用重拉
+				await this.recordSynced(succeeded, (path) => shaByPath.get(path));
+			}
 
 			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
