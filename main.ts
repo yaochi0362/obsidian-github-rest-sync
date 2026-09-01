@@ -969,6 +969,12 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
+		const versionEl = containerEl.createEl("div", {
+			text: `GitHub REST Sync v${this.plugin.manifest.version}`,
+			cls: "setting-item-description",
+		});
+		versionEl.style.marginBottom = "12px";
+
 		new Setting(containerEl)
 			.setName("Repository URL")
 			.setDesc("Paste a GitHub URL directly, e.g. https://github.com/yaochi0362/YCObsidian")
