@@ -38,13 +38,14 @@ class ProgressModal extends Modal {
 		ensureSpinnerStyle();
 		this.titleEl.setText(this.title);
 		this.contentEl.createDiv({ cls: "mds-spinner" });
-		this.messageEl = this.contentEl.createEl("div", { text: "準備中…" });
+		this.messageEl = this.contentEl.createEl("div", { text: "Preparing…" });
 		this.messageEl.style.textAlign = "center";
 		this.contentEl.createEl("div", {
-			text: "進行中，請勿關閉此視窗",
+			text: "In progress, please don't close this window",
 			cls: "setting-item-description",
 		}).style.textAlign = "center";
-		// 拿掉右上角關閉鈕，避免誤觸——背景其實不會被中斷，但會讓人失去進度可見度、誤以為取消了
+		// Remove the close button to prevent accidental taps - closing the background overlay would
+		// still call close(), which we override below so it can't be dismissed while running.
 		this.modalEl.querySelector(".modal-close-button")?.remove();
 	}
 
@@ -52,8 +53,8 @@ class ProgressModal extends Modal {
 		this.messageEl?.setText(text);
 	}
 
-	// 操作真正完成時呼叫這個，而不是 close()——點擊背景遮罩也會呼叫 close()，
-	// 覆寫掉它讓進行中無法被關閉。
+	// Call this when the operation actually finishes, instead of close() - clicking the background
+	// overlay also calls close(), and we override it here to block dismissal while running.
 	finish() {
 		this.allowClose = true;
 		this.close();
@@ -65,8 +66,9 @@ class ProgressModal extends Modal {
 	}
 }
 
-// 上次同步完成後，本機跟 GitHub 都一致的版本（path -> sha）。
-// 用來分辨「這是新檔案」還是「這是被刪掉的檔案」——單看目前兩邊有沒有這個檔案是分不出來的。
+// The last confirmed matching state between local and GitHub (path -> sha).
+// Needed to tell "this is a new file" apart from "this file was deleted" - looking only at
+// whether the path currently exists on either side can't distinguish the two.
 type SyncState = Record<string, string>;
 
 interface MultiDeviceSyncSettings {
@@ -93,24 +95,27 @@ interface ParsedRepo {
 	repo: string;
 }
 
-// 支援 https://github.com/owner/repo、.git 結尾、尾端斜線、以及 git@github.com:owner/repo.git 格式
+// Supports https://github.com/owner/repo, a trailing .git, a trailing slash, and the
+// git@github.com:owner/repo.git SSH form.
 function parseGithubRepoUrl(url: string): ParsedRepo | null {
 	const match = url.trim().match(/github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
 	if (!match) return null;
 	return { owner: match[1], repo: match[2] };
 }
 
-// GitHub token 的已知開頭：ghp_=classic PAT、github_pat_=fine-grained PAT、
-// gho_/ghu_/ghs_/ghr_=OAuth 系列。長度也粗略檢查一下，明顯太短的直接判定格式錯誤。
+// Known GitHub token prefixes: ghp_ = classic PAT, github_pat_ = fine-grained PAT,
+// gho_/ghu_/ghs_/ghr_ = OAuth family. Also does a rough length check; anything clearly
+// too short is treated as a format error.
 function looksLikeGithubToken(token: string): boolean {
 	return /^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{10,}$/.test(token);
 }
 
-const REPORT_FILE_PATH = normalizePath("多裝置同步報告.md");
+const REPORT_FILE_PATH = normalizePath("GitHub REST Sync Report.md");
 
-// 目前不同步的路徑前綴：裝置各自的 Obsidian 設定/暫存
+// Path prefixes that are never synced: each device's own Obsidian config/cache.
 const EXCLUDED_PREFIXES = [".obsidian/", ".git/", ".trash/"];
-// 每次跑都會重新產生、內容一定會變的檔案：不列入比對，不然永遠會被判定成「內容不同」
+// Files that get regenerated with different content on every run: excluded from the diff,
+// otherwise they'd permanently show up as "content differs".
 const EXCLUDED_PATHS = [REPORT_FILE_PATH];
 
 interface GitTreeEntry {
@@ -128,9 +133,9 @@ interface PlannedChange {
 }
 
 interface DiffResult {
-	toPush: PlannedChange[]; // 本機動過、GitHub 沒動：套用到 GitHub
-	toPull: PlannedChange[]; // GitHub 動過、本機沒動：套用到本機
-	conflicts: string[]; // 兩邊都動過，而且動的不一樣：不自動處理
+	toPush: PlannedChange[]; // Changed locally, not on GitHub: apply to GitHub
+	toPull: PlannedChange[]; // Changed on GitHub, not locally: apply locally
+	conflicts: string[]; // Changed on both sides, and differently: not handled automatically
 	inSyncCount: number;
 }
 
@@ -141,7 +146,7 @@ function isExcluded(path: string): boolean {
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
 	const uint8 = new Uint8Array(bytes);
 	let binary = "";
-	const chunkSize = 0x8000; // 避免大檔案一次 apply 太多參數炸掉呼叫堆疊
+	const chunkSize = 0x8000; // avoids blowing the call stack by apply()-ing too many arguments for large files
 	for (let i = 0; i < uint8.length; i += chunkSize) {
 		binary += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
 	}
@@ -174,12 +179,13 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private quickSyncDebounceTimer: number | null = null;
 	private syncIntervalId: number | null = null;
 
-	// 統一入口：擋掉重疊執行（同一個 batch push 跑到一半又被點一次，
-	// 兩邊各自 fast-forward branch 會互相踩到），並常駐一個進度視窗，
-	// 過程中只更新視窗文字，不再連續跳好幾個 Notice。
+	// Single entry point: blocks overlapping runs (e.g. tapping the button again mid-batch-push
+	// would have both runs fast-forwarding the branch and stepping on each other), and keeps one
+	// progress modal open for the whole operation, updating its text instead of firing a stream
+	// of separate Notices.
 	private async withProgress(title: string, fn: (modal: ProgressModal) => Promise<string>) {
 		if (this.syncing) {
-			new Notice("已經有一個同步作業在執行中，請稍候");
+			new Notice("A sync is already running, please wait");
 			return;
 		}
 		this.syncing = true;
@@ -190,23 +196,25 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			new Notice(finalMessage);
 		} catch (error) {
 			console.error(`[multi-device-sync] ${title} failed`, error);
-			new Notice(`${title}失敗：${error instanceof Error ? error.message : String(error)}`);
+			new Notice(`${title} failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			modal.finish();
 			this.syncing = false;
 		}
 	}
 
-	// BRAT 在手機上更新時，不一定會先正確卸載舊版本，導致舊版本註冊的 ribbon 項目
-	// 沒被清掉、每次改版都多疊一個。這裡不管上一輪乾不乾淨，都先主動清一次舊的。
+	// BRAT's mobile update flow doesn't reliably unload the previous version first, so ribbon
+	// items registered by an old version can linger and stack up release after release.
+	// Regardless of whether the last unload was clean, proactively clear any old ones first.
 	private removeStaleRibbonIcons() {
 		document
 			.querySelectorAll('[aria-label^="Multi-Device Sync"], [aria-label^="GitHub REST Sync"]')
 			.forEach((el) => el.remove());
 	}
 
-	// 同樣道理，指令 id 曾經在不同版本被重複使用/移除過，直接用 app 內部 API 依 id 清掉，
-	// 不依賴前一輪 onunload 有沒有正常執行。
+	// Same idea for commands - some ids were reused/removed across past versions. Purge them by
+	// id via the internal app API directly, rather than depending on the previous onunload
+	// having run cleanly.
 	private removeStaleCommands() {
 		const staleIds = ["multi-device-sync-dry-run", "multi-device-sync-pull-new", "multi-device-sync-push-new"];
 		const commands = (this.app as unknown as { commands: { removeCommand: (id: string) => void } }).commands;
@@ -214,7 +222,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			try {
 				commands.removeCommand(`${this.manifest.id}:${id}`);
 			} catch {
-				// 本來就沒有這個指令的話會丟錯，忽略即可
+				// throws if the command doesn't exist yet, which is fine to ignore
 			}
 		}
 	}
@@ -227,30 +235,31 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 		this.addSettingTab(new MultiDeviceSyncSettingTab(this.app, this));
 
-		this.addRibbonIcon("refresh-cw", "GitHub REST Sync：一鍵同步", () => {
+		this.addRibbonIcon("refresh-cw", "GitHub REST Sync: One-Click Sync", () => {
 			this.syncAll();
 		});
 
 		this.addCommand({
 			id: "github-rest-sync-ping",
-			name: "GitHub REST Sync: 測試安裝是否成功",
+			name: "GitHub REST Sync: Test Installation",
 			callback: () => {
-				new Notice("GitHub REST Sync 安裝成功 ✅");
+				new Notice("GitHub REST Sync installed successfully ✅");
 			},
 		});
 
 		this.addCommand({
 			id: "github-rest-sync-all",
-			name: "GitHub REST Sync: 一鍵同步（推送＋拉取）",
+			name: "GitHub REST Sync: One-Click Sync (Push + Pull)",
 			callback: () => this.syncAll(),
 		});
 
 		this.setupSyncInterval();
 
-		// onLayoutReady 之後才開始：vault 剛開啟時會把既有檔案也當成 create 事件回放一次，
-		// 太早註冊會誤判成「一堆新增檔案」狂觸發同步。
+		// Only start after onLayoutReady: when a vault first opens, Obsidian replays a "create"
+		// event for every pre-existing file, so registering too early would misread that as a
+		// flood of new files and fire sync repeatedly.
 		this.app.workspace.onLayoutReady(() => {
-			this.quickSync(); // 開啟時同步
+			this.quickSync(); // Sync once on open
 
 			this.registerEvent(
 				this.app.vault.on("create", (file) => {
@@ -269,7 +278,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			);
 		});
 
-		new Notice("GitHub REST Sync 已載入");
+		new Notice("GitHub REST Sync loaded");
 	}
 
 	onunload() {
@@ -280,9 +289,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
-	// 外掛 id 從 multi-device-sync 改名成 github-rest-sync 時，這裡是舊資料夾的路徑。
-	// 一次性搬移用：全新安裝（loadData 是空的）時，如果舊資料夾還留著設定檔，直接讀過來當初始值，
-	// 這樣改 id/資料夾名稱就不會把每台裝置的 syncState 同步歷史清空重來。
+	// Path of the old plugin folder from when the plugin id was renamed from multi-device-sync
+	// to github-rest-sync. One-time migration: on a fresh install (loadData is empty), if the
+	// old folder's settings file is still there, read it in as the initial value - this way
+	// changing the id/folder name doesn't reset every device's syncState history.
 	private static readonly OLD_PLUGIN_ID = "multi-device-sync";
 
 	async loadSettings() {
@@ -294,7 +304,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					const oldData = JSON.parse(await this.app.vault.adapter.read(oldDataPath));
 					this.settings = Object.assign({}, DEFAULT_SETTINGS, oldData);
 					await this.saveSettings();
-					new Notice("已從舊版外掛搬移設定與同步紀錄");
+					new Notice("Migrated settings and sync history from the previous plugin");
 					return;
 				} catch (error) {
 					console.error("[github-rest-sync] failed to migrate settings from old plugin folder", error);
@@ -308,8 +318,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// statusEl 存在就把結果寫進那個元素（顏色＋文字），供設定頁即時顯示；
-	// 沒帶 statusEl（例如手動按鈕觸發）就額外補一個 Notice。
+	// If a statusEl is provided, write the result into it (color + text) for live display on
+	// the settings page.
 	async validateToken(statusEl?: HTMLElement) {
 		const setStatus = (text: string, color: string) => {
 			if (statusEl) {
@@ -325,35 +335,35 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 
 		if (!looksLikeGithubToken(token)) {
-			setStatus("❌ Token 格式看起來不對（GitHub token 通常以 ghp_ 或 github_pat_ 開頭）", "var(--text-error)");
+			setStatus("❌ Token format looks wrong (GitHub tokens usually start with ghp_ or github_pat_)", "var(--text-error)");
 			return;
 		}
 
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
 		if (!parsed) {
-			setStatus("⚠️ 格式正確，但 repository 網址還沒填對，無法測試連線", "var(--text-warning)");
+			setStatus("⚠️ Format looks fine, but the repository URL isn't valid yet, so the connection can't be tested", "var(--text-warning)");
 			return;
 		}
 
-		setStatus("⏳ 驗證中…", "var(--text-muted)");
+		setStatus("⏳ Verifying…", "var(--text-muted)");
 		try {
 			const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`;
 			const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
 			if (res.status === 200) {
 				const data = res.json as { default_branch: string; private: boolean };
 				setStatus(
-					`✅ 連線成功：${parsed.owner}/${parsed.repo}（${data.private ? "private" : "public"}，預設 branch: ${data.default_branch}）`,
+					`✅ Connected: ${parsed.owner}/${parsed.repo} (${data.private ? "private" : "public"}, default branch: ${data.default_branch})`,
 					"var(--text-success)",
 				);
 			} else if (res.status === 401) {
-				setStatus("❌ Token 無效或已過期 (401)", "var(--text-error)");
+				setStatus("❌ Token invalid or expired (401)", "var(--text-error)");
 			} else if (res.status === 404) {
-				setStatus("❌ 找不到這個 repo，或 token 沒有存取權限 (404)", "var(--text-error)");
+				setStatus("❌ Repo not found, or the token doesn't have access (404)", "var(--text-error)");
 			} else {
-				setStatus(`❌ 連線失敗 (${res.status})：${res.text}`, "var(--text-error)");
+				setStatus(`❌ Connection failed (${res.status}): ${res.text}`, "var(--text-error)");
 			}
 		} catch (error) {
-			setStatus(`❌ 連線失敗：${error instanceof Error ? error.message : String(error)}`, "var(--text-error)");
+			setStatus(`❌ Connection failed: ${error instanceof Error ? error.message : String(error)}`, "var(--text-error)");
 		}
 	}
 
@@ -366,22 +376,23 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private async fetchRemoteTree(): Promise<GitTreeEntry[]> {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
-		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		if (!parsed) throw new Error("Could not parse the repository URL");
 		const { owner, repo } = parsed;
 		const { branch } = this.settings;
 		const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
 		const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
 		if (res.status === 409) {
-			// repo 剛建立、還沒有任何 commit 時，GitHub 會回 409 "Git Repository is empty."——
-			// 這不是錯誤，只是代表遠端目前是空的，繼續往下走，diff 出來會是「全部只在本機」
+			// GitHub returns 409 "Git Repository is empty." for a brand-new repo with no commits
+			// yet - not an error, it just means the remote is currently empty; carry on, and the
+			// diff will show everything as local-only.
 			return [];
 		}
 		if (res.status !== 200) {
-			throw new Error(`GitHub API 錯誤 (${res.status}): ${res.text}`);
+			throw new Error(`GitHub API error (${res.status}): ${res.text}`);
 		}
 		const data = res.json as { tree: GitTreeEntry[]; truncated: boolean };
 		if (data.truncated) {
-			new Notice("⚠️ 這個 repo 檔案數太多，GitHub 回傳的清單被截斷了，比對結果可能不完整");
+			new Notice("⚠️ This repo has too many files - GitHub truncated the file list, so the diff may be incomplete");
 		}
 		return data.tree.filter((entry) => entry.type === "blob" && !isExcluded(entry.path));
 	}
@@ -397,9 +408,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return result;
 	}
 
-	// 三方比對（跟 git 判斷要不要衝突同一套邏輯）：拿「上次同步後雙方一致的版本」當基準，
-	// 只有一邊變動就能安全地自動套用到另一邊，兩邊都變動而且變得不一樣才是真衝突。
-	// 同時會把 syncState 裡「兩邊都已經一致」的項目補起來（自我修復，不管是不是本來就在裡面）。
+	// Three-way diff (the same logic git uses to decide whether something is a conflict): using
+	// "the version both sides agreed on after the last sync" as the baseline, a change on only
+	// one side can be safely auto-applied to the other; only when both sides changed, and
+	// differently, is it a real conflict. Also backfills syncState for any path that's now
+	// consistent on both sides (self-healing, regardless of whether it was already tracked).
 	private diff(remoteTree: GitTreeEntry[], localShas: Map<string, string>): DiffResult {
 		const remoteByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
 		const syncState = this.settings.syncState;
@@ -445,7 +458,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 
 		if (syncStateChanged) {
-			// 不 await：這只是把自我修復的結果存起來，不影響這次比對結果
+			// Not awaited: this just persists the self-healing result and doesn't affect this diff's outcome
 			void this.saveSettings();
 		}
 
@@ -456,27 +469,25 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	}
 
 	private buildReportMarkdown(result: DiffResult): string {
-		const actionLabel: Record<ChangeAction, string> = { create: "新增", modify: "修改", delete: "刪除" };
+		const actionLabel: Record<ChangeAction, string> = { create: "Added", modify: "Modified", delete: "Deleted" };
 		const changeSection = (title: string, items: PlannedChange[]) =>
 			items.length > 0
-				? `## ${title}（${items.length}）\n${items.map((c) => `- [${actionLabel[c.action]}] ${c.path}`).join("\n")}\n`
-				: `## ${title}（0）\n（無）\n`;
+				? `## ${title} (${items.length})\n${items.map((c) => `- [${actionLabel[c.action]}] ${c.path}`).join("\n")}\n`
+				: `## ${title} (0)\n(none)\n`;
 		const pathSection = (title: string, items: string[]) =>
 			items.length > 0
-				? `## ${title}（${items.length}）\n${items.map((p) => `- ${p}`).join("\n")}\n`
-				: `## ${title}（0）\n（無）\n`;
+				? `## ${title} (${items.length})\n${items.map((p) => `- ${p}`).join("\n")}\n`
+				: `## ${title} (0)\n(none)\n`;
 
 		return [
-			`# 多裝置同步差異報告`,
+			`# GitHub REST Sync Diff Report`,
 			``,
-			`產生時間：${new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}`,
-			`已同步（內容一致）：${result.inSyncCount} 個檔案`,
+			`Generated: ${new Date().toLocaleString("en-US", { timeZone: "Asia/Taipei" })}`,
+			`In sync (matching content): ${result.inSyncCount} files`,
 			``,
-			changeSection("只有本機動過，會推上 GitHub", result.toPush),
-			changeSection("只有 GitHub 動過，會拉回本機", result.toPull),
-			pathSection("兩邊都動過，而且動的不一樣（需要人工判斷留哪一份）", result.conflicts),
-			``,
-			`> 這份報告只讀不寫，沒有任何檔案被實際同步或覆蓋。`,
+			changeSection("Changed locally only - will be pushed to GitHub", result.toPush),
+			changeSection("Changed on GitHub only - will be pulled locally", result.toPull),
+			pathSection("Changed on both sides, differently (needs manual review)", result.conflicts),
 		].join("\n");
 	}
 
@@ -486,7 +497,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private checkConfigured(): boolean {
 		if (!this.isConfigured()) {
-			new Notice("請先到 GitHub REST Sync 設定頁填好 repository 網址 / token");
+			new Notice("Please fill in the repository URL / token on the GitHub REST Sync settings page first");
 			return false;
 		}
 		return true;
@@ -498,7 +509,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return { remoteTree, localShas, result };
 	}
 
-	// push/pull 成功套用一批變更之後，把 syncState 更新成「雙方現在的共同版本」。
+	// After a push/pull batch is successfully applied, update syncState to "what both sides now agree on".
 	private async recordSynced(changes: PlannedChange[], newShaFor: (path: string) => string | undefined) {
 		for (const change of changes) {
 			if (change.action === "delete") {
@@ -518,11 +529,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private async fetchBlobContent(sha: string): Promise<ArrayBuffer> {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
-		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		if (!parsed) throw new Error("Could not parse the repository URL");
 		const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/blobs/${sha}`;
 		const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
 		if (res.status !== 200) {
-			throw new Error(`抓取檔案內容失敗 (${res.status}): ${res.text}`);
+			throw new Error(`Failed to fetch file content (${res.status}): ${res.text}`);
 		}
 		const data = res.json as { content: string; encoding: string };
 		return base64ToArrayBuffer(data.content);
@@ -538,7 +549,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	private repoApiBase(): string {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
-		if (!parsed) throw new Error("Repository 網址格式無法解析");
+		if (!parsed) throw new Error("Could not parse the repository URL");
 		return `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`;
 	}
 
@@ -553,19 +564,20 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return { status: res.status, json: res.json as T, text: res.text };
 	}
 
-	// 讀取目前 branch 指向的 commit/tree sha，當作批次推送的 base_tree。
-	// repo 還沒有任何 commit 時（全新 repo）ref 不存在，回傳 null，之後改用「建立第一個 commit」的流程。
+	// Reads the commit/tree sha the branch currently points to, used as the base_tree for
+	// batched pushes. If the repo has no commits yet (brand new), the ref doesn't exist and this
+	// returns null, falling back to the "create the first commit" path.
 	private async getBranchHead(): Promise<{ commitSha: string; treeSha: string } | null> {
 		const refRes = await this.githubJson<{ object: { sha: string } }>(
 			`${this.repoApiBase()}/git/refs/heads/${encodeURIComponent(this.settings.branch)}`,
 			"GET",
 		);
 		if (refRes.status === 404) return null;
-		if (refRes.status !== 200) throw new Error(`取得 branch 資訊失敗 (${refRes.status}): ${refRes.text}`);
+		if (refRes.status !== 200) throw new Error(`Failed to get branch info (${refRes.status}): ${refRes.text}`);
 		const commitSha = refRes.json.object.sha;
 
 		const commitRes = await this.githubJson<{ tree: { sha: string } }>(`${this.repoApiBase()}/git/commits/${commitSha}`, "GET");
-		if (commitRes.status !== 200) throw new Error(`取得 commit 資訊失敗 (${commitRes.status}): ${commitRes.text}`);
+		if (commitRes.status !== 200) throw new Error(`Failed to get commit info (${commitRes.status}): ${commitRes.text}`);
 		return { commitSha, treeSha: commitRes.json.tree.sha };
 	}
 
@@ -577,9 +589,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
-	// 文字檔直接把內容塞進 tree entry（GitHub 會自動幫你建 blob），
-	// 二進位檔（圖片、PDF 等）才需要先呼叫 blobs API 拿 sha。
-	// 刪除則是 sha: null——GitHub tree API 用這個表示「從 base_tree 繼承的內容裡把這個路徑移除」。
+	// Text files embed their content directly in the tree entry (GitHub creates the blob for
+	// you); only binary files (images, PDFs, etc.) need a separate call to the blobs API first
+	// to get a sha. A delete is represented as sha: null - that's how the GitHub tree API says
+	// "remove this path from what was inherited via base_tree".
 	private async buildTreeEntry(
 		change: PlannedChange,
 	): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string | null }> {
@@ -596,12 +609,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			content: arrayBufferToBase64(bytes),
 			encoding: "base64",
 		});
-		if (blobRes.status !== 201) throw new Error(`建立 blob 失敗 (${blobRes.status}): ${blobRes.text}`);
+		if (blobRes.status !== 201) throw new Error(`Failed to create blob (${blobRes.status}): ${blobRes.text}`);
 		return { path: change.path, mode: "100644", type: "blob", sha: blobRes.json.sha };
 	}
 
-	// 把一批變更（新增/修改/刪除）打包成「一個」commit：建 tree（掛在 base_tree 上）→ 建 commit → 更新 branch ref。
-	// 回傳新的 commit/tree sha，供下一批接續使用（每批之後都要 fast-forward，不然下一批的 base_tree 會過時）。
+	// Packs a batch of changes (create/modify/delete) into a single commit: build a tree (on top
+	// of base_tree) -> create a commit -> update the branch ref. Returns the new commit/tree sha
+	// so the next batch can build on it (each batch must fast-forward, otherwise the next
+	// batch's base_tree would be stale).
 	private async commitBatch(
 		changes: PlannedChange[],
 		base: { commitSha: string; treeSha: string } | null,
@@ -616,7 +631,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			tree: entries,
 			...(base ? { base_tree: base.treeSha } : {}),
 		});
-		if (treeRes.status !== 201) throw new Error(`建立 tree 失敗 (${treeRes.status}): ${treeRes.text}`);
+		if (treeRes.status !== 201) throw new Error(`Failed to create tree (${treeRes.status}): ${treeRes.text}`);
 		const newTreeSha = treeRes.json.sha;
 
 		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
@@ -624,7 +639,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			tree: newTreeSha,
 			...(base ? { parents: [base.commitSha] } : {}),
 		});
-		if (commitRes.status !== 201) throw new Error(`建立 commit 失敗 (${commitRes.status}): ${commitRes.text}`);
+		if (commitRes.status !== 201) throw new Error(`Failed to create commit (${commitRes.status}): ${commitRes.text}`);
 		const newCommitSha = commitRes.json.sha;
 
 		const refUrl = base
@@ -637,15 +652,16 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			return { commitSha: newCommitSha, treeSha: newTreeSha };
 		}
 
-		// 422 (not a fast forward) / 409：branch 在我們讀取之後被別的東西動過
-		// （例如同一個操作被重複觸發、或另一台裝置也在同時推送）。
-		// 重新讀一次目前的 head，用新的 base 重做這批 tree+commit 再試一次。
+		// 422 (not a fast forward) / 409: the branch was moved by something else after we read
+		// it (e.g. the same operation got triggered twice, or another device is pushing at the
+		// same time). Re-read the current head and redo this batch's tree+commit against the
+		// fresh base.
 		if ((refRes.status === 422 || refRes.status === 409) && retriesLeft > 0) {
 			const freshBase = await this.getBranchHead();
 			return this.commitBatch(changes, freshBase, retriesLeft - 1);
 		}
 
-		throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
+		throw new Error(`Failed to update branch (${refRes.status}): ${refRes.text}`);
 	}
 
 	private async applyPush(
@@ -664,7 +680,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let head = await this.getBranchHead();
 		let done = 0;
 		for (let i = 0; i < batches.length; i++) {
-			onProgress(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			onProgress(`Pushing… commit ${i + 1}/${batches.length} (${done}/${changes.length} files done)`);
 			head = await this.commitBatch(batches[i], head);
 			await this.recordSynced(batches[i], (path) => localShas.get(path));
 			done += batches[i].length;
@@ -677,7 +693,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		shaByPath: Map<string, string>,
 		onProgress: (msg: string) => void = () => {},
 	): Promise<{ done: number; failed: number }> {
-		const PULL_BATCH_SIZE = 20; // 每批平行抓取，批次之間依序，避免一次開太多平行請求
+		const PULL_BATCH_SIZE = 20; // each batch fetches in parallel, batches run sequentially, to avoid too many parallel requests at once
 		if (changes.length === 0) return { done: 0, failed: 0 };
 
 		const batches: PlannedChange[][] = [];
@@ -688,7 +704,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let done = 0;
 		let failed = 0;
 		for (let i = 0; i < batches.length; i++) {
-			onProgress(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			onProgress(`Pulling… batch ${i + 1}/${batches.length} (${done}/${changes.length} files done)`);
 			const batch = batches[i];
 			const outcomes = await Promise.allSettled(
 				batch.map(async (change) => {
@@ -696,7 +712,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 						await this.app.vault.adapter.remove(change.path);
 					} else {
 						const sha = shaByPath.get(change.path);
-						if (!sha) throw new Error("找不到對應的 blob sha");
+						if (!sha) throw new Error("Could not find the matching blob sha");
 						const bytes = await this.fetchBlobContent(sha);
 						await this.ensureParentFolder(change.path);
 						await this.app.vault.adapter.writeBinary(change.path, bytes);
@@ -715,19 +731,21 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					console.error("[multi-device-sync] pull failed", outcome.reason);
 				}
 			}
-			// 每批結束就存一次記錄——就算之後被中斷，這批已經成功的也不用重拉
+			// Persist the record after each batch - even if interrupted later, files that
+			// already succeeded in this batch won't need to be pulled again.
 			await this.recordSynced(succeeded, (path) => shaByPath.get(path));
 		}
 		return { done, failed };
 	}
 
-	// 唯一對外的同步入口：比對 → 推送本機獨有的變更 → 拉取 GitHub 獨有的變更 → 有衝突就跳出選擇視窗。
+	// The single public sync entry point: diff -> push local-only changes -> pull GitHub-only
+	// changes -> open the resolution modal if there are conflicts.
 	async syncAll() {
 		if (!this.checkConfigured()) return;
 
 		let conflicts: string[] = [];
-		await this.withProgress("一鍵同步", async (modal) => {
-			modal.setMessage("比對中…");
+		await this.withProgress("One-Click Sync", async (modal) => {
+			modal.setMessage("Comparing…");
 			const { remoteTree, localShas, result } = await this.computeDiffNow();
 
 			const pushed = await this.applyPush(result.toPush, localShas, (msg) => modal.setMessage(msg));
@@ -737,16 +755,16 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				modal.setMessage(msg),
 			);
 
-			modal.setMessage("更新比對報告…");
+			modal.setMessage("Updating diff report…");
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
 			conflicts = finalResult.conflicts;
 
-			const parts = [`推送 ${pushed} 個`, `拉取 ${pulled} 個${pullFailed > 0 ? `（失敗 ${pullFailed}）` : ""}`];
+			const parts = [`Pushed ${pushed}`, `Pulled ${pulled}${pullFailed > 0 ? ` (${pullFailed} failed)` : ""}`];
 			if (conflicts.length > 0) {
-				parts.push(`發現 ${conflicts.length} 個衝突，等等會跳出選擇視窗`);
+				parts.push(`Found ${conflicts.length} conflict(s) - a resolution dialog will open`);
 			}
-			return `一鍵同步完成：${parts.join("、")}`;
+			return `One-Click Sync complete: ${parts.join(", ")}`;
 		});
 
 		if (conflicts.length > 0) {
@@ -754,8 +772,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
-	// 自動觸發用的安靜版本：開啟時、定時、新增/刪除/改名事件都走這條路。
-	// 不開進度視窗，沒有變化就完全不出聲，避免每 10 分鐘或每次存檔都跳提示。
+	// The quiet variant used for automatic triggers: on open, on the timer, and on
+	// create/delete/rename events all go through this. No progress modal, and it stays
+	// completely silent when nothing changed, so it doesn't nag every 10 minutes or on every
+	// file save.
 	async quickSync() {
 		if (!this.isConfigured()) return;
 		if (this.syncing) return;
@@ -772,9 +792,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			await this.writeReport(finalResult);
 
 			if (pushed > 0 || pulled > 0 || pullFailed > 0 || finalResult.conflicts.length > 0) {
-				const parts = [`推送 ${pushed}`, `拉取 ${pulled}${pullFailed > 0 ? `（失敗 ${pullFailed}）` : ""}`];
-				if (finalResult.conflicts.length > 0) parts.push(`⚠️ ${finalResult.conflicts.length} 個衝突`);
-				new Notice(`Quick Sync：${parts.join("、")}`);
+				const parts = [`Pushed ${pushed}`, `Pulled ${pulled}${pullFailed > 0 ? ` (${pullFailed} failed)` : ""}`];
+				if (finalResult.conflicts.length > 0) parts.push(`⚠️ ${finalResult.conflicts.length} conflict(s)`);
+				new Notice(`Quick Sync: ${parts.join(", ")}`);
 			}
 
 			if (finalResult.conflicts.length > 0) {
@@ -782,13 +802,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			}
 		} catch (error) {
 			console.error("[multi-device-sync] quick sync failed", error);
-			new Notice(`Quick Sync 失敗：${error instanceof Error ? error.message : String(error)}`);
+			new Notice(`Quick Sync failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			this.syncing = false;
 		}
 	}
 
-	// 新增/刪除/改名事件的防抖動：短時間內連續觸發只會在最後一次之後跑一次。
+	// Debounce for create/delete/rename events: a burst of triggers in a short window collapses
+	// into one run after the last one.
 	private scheduleQuickSync(delayMs = 3000) {
 		if (this.quickSyncDebounceTimer !== null) {
 			window.clearTimeout(this.quickSyncDebounceTimer);
@@ -799,7 +820,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}, delayMs);
 	}
 
-	// 依設定的分鐘數重新建立定時同步；設定變更時也要呼叫這個換成新的間隔。
+	// Rebuilds the periodic sync timer using the configured minutes; call this again whenever
+	// the setting changes to swap in the new interval.
 	setupSyncInterval() {
 		if (this.syncIntervalId !== null) {
 			window.clearInterval(this.syncIntervalId);
@@ -810,7 +832,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		this.registerInterval(this.syncIntervalId);
 	}
 
-	// 單一檔案的衝突解決：選一邊，直接以那一邊的內容覆蓋另一邊。
+	// Resolve a single file's conflict: pick a side, and overwrite the other side with that content.
 	async resolveConflict(path: string, keep: "local" | "remote") {
 		if (keep === "local") {
 			const bytes = await this.app.vault.adapter.readBinary(path);
@@ -819,7 +841,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		} else {
 			const remoteTree = await this.fetchRemoteTree();
 			const entry = remoteTree.find((e) => e.path === path);
-			if (!entry) throw new Error("GitHub 上找不到這個檔案，可能已經被刪除");
+			if (!entry) throw new Error("Couldn't find this file on GitHub - it may have been deleted");
 			await this.applyPull([{ path, action: "modify" }], new Map([[path, entry.sha]]));
 		}
 	}
@@ -828,9 +850,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		try {
 			const bytes = await this.app.vault.adapter.readBinary(path);
 			const text = this.decodeAsUtf8IfPossible(bytes);
-			return text !== null ? text.slice(0, 300) : "（二進位檔案，無法預覽）";
+			return text !== null ? text.slice(0, 300) : "(Binary file, no preview available)";
 		} catch (error) {
-			return `（讀取失敗：${error instanceof Error ? error.message : String(error)}）`;
+			return `(Failed to read: ${error instanceof Error ? error.message : String(error)})`;
 		}
 	}
 
@@ -838,12 +860,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		try {
 			const remoteTree = await this.fetchRemoteTree();
 			const entry = remoteTree.find((e) => e.path === path);
-			if (!entry) return "（GitHub 上找不到這個檔案）";
+			if (!entry) return "(File not found on GitHub)";
 			const bytes = await this.fetchBlobContent(entry.sha);
 			const text = this.decodeAsUtf8IfPossible(bytes);
-			return text !== null ? text.slice(0, 300) : "（二進位檔案，無法預覽）";
+			return text !== null ? text.slice(0, 300) : "(Binary file, no preview available)";
 		} catch (error) {
-			return `（讀取失敗：${error instanceof Error ? error.message : String(error)}）`;
+			return `(Failed to read: ${error instanceof Error ? error.message : String(error)})`;
 		}
 	}
 }
@@ -858,9 +880,9 @@ class ConflictModal extends Modal {
 	}
 
 	async onOpen() {
-		this.titleEl.setText(`有 ${this.conflicts.length} 個檔案衝突需要選擇`);
+		this.titleEl.setText(`${this.conflicts.length} file conflict${this.conflicts.length === 1 ? "" : "s"} to resolve`);
 		this.contentEl.createEl("div", {
-			text: "兩邊都改過同一個檔案，選一邊留下，另一邊會被覆蓋。",
+			text: "Both sides changed the same file. Pick one to keep - the other side will be overwritten.",
 			cls: "setting-item-description",
 		});
 
@@ -890,7 +912,7 @@ class ConflictModal extends Modal {
 		]);
 
 		for (const [label, preview] of [
-			["本機", localPreview],
+			["Local", localPreview],
 			["GitHub", remotePreview],
 		] as const) {
 			const col = previewsEl.createDiv();
@@ -911,19 +933,19 @@ class ConflictModal extends Modal {
 
 		const statusEl = row.createDiv();
 
-		const localBtn = buttonsEl.createEl("button", { text: "保留本機" });
-		const remoteBtn = buttonsEl.createEl("button", { text: "保留 GitHub" });
+		const localBtn = buttonsEl.createEl("button", { text: "Keep Local" });
+		const remoteBtn = buttonsEl.createEl("button", { text: "Keep GitHub" });
 
 		const resolve = async (keep: "local" | "remote") => {
 			localBtn.disabled = true;
 			remoteBtn.disabled = true;
-			statusEl.setText("處理中…");
+			statusEl.setText("Applying…");
 			try {
 				await this.plugin.resolveConflict(path, keep);
-				statusEl.setText(`✅ 已保留${keep === "local" ? "本機" : "GitHub"}版本`);
+				statusEl.setText(`✅ Kept the ${keep === "local" ? "local" : "GitHub"} version`);
 				statusEl.style.color = "var(--text-success)";
 			} catch (error) {
-				statusEl.setText(`❌ 處理失敗：${error instanceof Error ? error.message : String(error)}`);
+				statusEl.setText(`❌ Failed: ${error instanceof Error ? error.message : String(error)}`);
 				statusEl.style.color = "var(--text-error)";
 				localBtn.disabled = false;
 				remoteBtn.disabled = false;
@@ -948,8 +970,8 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName("Repository 網址")
-			.setDesc("直接貼 GitHub 網址，例如 https://github.com/yaochi0362/YCObsidian")
+			.setName("Repository URL")
+			.setDesc("Paste a GitHub URL directly, e.g. https://github.com/yaochi0362/YCObsidian")
 			.addText((text) =>
 				text.setValue(this.plugin.settings.repoUrl).onChange(async (value) => {
 					this.plugin.settings.repoUrl = value.trim();
@@ -966,14 +988,14 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 			} else if (parsed) {
 				parsedDisplay.setText(`✅ Owner: ${parsed.owner}　Repo: ${parsed.repo}`);
 			} else {
-				parsedDisplay.setText("⚠️ 無法從這個網址解析出 owner/repo，請確認格式");
+				parsedDisplay.setText("⚠️ Couldn't parse an owner/repo from this URL - please check the format");
 			}
 		};
 		updateParsedDisplay();
 
 		new Setting(containerEl)
 			.setName("Branch")
-			.setDesc("預設 main")
+			.setDesc("Defaults to main")
 			.addText((text) =>
 				text.setValue(this.plugin.settings.branch).onChange(async (value) => {
 					this.plugin.settings.branch = value.trim() || "main";
@@ -983,7 +1005,9 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("GitHub Personal Access Token")
-			.setDesc("Fine-grained token，Contents 權限至少要 Read-only。這裡存在本機的 data.json，未加密，跟大多數同類外掛一樣。貼上後會自動驗證")
+			.setDesc(
+				"Fine-grained token with Contents: Read and write access to the target repo (write is required for pushing). Stored unencrypted in the local data.json, same as most similar plugins. Validated automatically once pasted.",
+			)
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text.setValue(this.plugin.settings.token).onChange(async (value) => {
@@ -997,17 +1021,19 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 		this.plugin.validateToken(tokenStatus);
 
 		new Setting(containerEl)
-			.setName("重新測試連線")
-			.setDesc("網址或 token 沒變但想手動再測一次時使用")
+			.setName("Retest Connection")
+			.setDesc("Use this to manually retest without changing the URL or token")
 			.addButton((button) =>
-				button.setButtonText("測試").onClick(async () => {
+				button.setButtonText("Test").onClick(async () => {
 					await this.plugin.validateToken(tokenStatus);
 				}),
 			);
 
 		new Setting(containerEl)
-			.setName("定時同步間隔（分鐘）")
-			.setDesc(`${MIN_SYNC_INTERVAL_MINUTES}~${MAX_SYNC_INTERVAL_MINUTES} 分鐘，預設 10。開啟時、以及新增/刪除/改名檔案時也會另外觸發一次 Quick Sync`)
+			.setName("Sync interval (minutes)")
+			.setDesc(
+				`${MIN_SYNC_INTERVAL_MINUTES}-${MAX_SYNC_INTERVAL_MINUTES} minutes, defaults to 10. A Quick Sync is also triggered separately on open and whenever a file is created, deleted, or renamed`,
+			)
 			.addText((text) => {
 				text.inputEl.type = "number";
 				text.inputEl.min = String(MIN_SYNC_INTERVAL_MINUTES);
