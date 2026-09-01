@@ -74,6 +74,7 @@ interface MultiDeviceSyncSettings {
 	branch: string;
 	token: string;
 	syncState: SyncState;
+	syncIntervalMinutes: number;
 }
 
 const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
@@ -81,7 +82,11 @@ const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
 	branch: "main",
 	token: "",
 	syncState: {},
+	syncIntervalMinutes: 10,
 };
+
+const MIN_SYNC_INTERVAL_MINUTES = 1;
+const MAX_SYNC_INTERVAL_MINUTES = 1440;
 
 interface ParsedRepo {
 	owner: string;
@@ -166,6 +171,8 @@ async function gitBlobSha1(bytes: ArrayBuffer): Promise<string> {
 export default class MultiDeviceSyncPlugin extends Plugin {
 	settings: MultiDeviceSyncSettings;
 	private syncing = false;
+	private quickSyncDebounceTimer: number | null = null;
+	private syncIntervalId: number | null = null;
 
 	// 統一入口：擋掉重疊執行（同一個 batch push 跑到一半又被點一次，
 	// 兩邊各自 fast-forward branch 會互相踩到），並常駐一個進度視窗，
@@ -236,11 +243,39 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			callback: () => this.syncAll(),
 		});
 
+		this.setupSyncInterval();
+
+		// onLayoutReady 之後才開始：vault 剛開啟時會把既有檔案也當成 create 事件回放一次，
+		// 太早註冊會誤判成「一堆新增檔案」狂觸發同步。
+		this.app.workspace.onLayoutReady(() => {
+			this.quickSync(); // 開啟時同步
+
+			this.registerEvent(
+				this.app.vault.on("create", (file) => {
+					if (!isExcluded(file.path)) this.scheduleQuickSync();
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("delete", (file) => {
+					if (!isExcluded(file.path)) this.scheduleQuickSync();
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("rename", (file, oldPath) => {
+					if (!isExcluded(file.path) || !isExcluded(oldPath)) this.scheduleQuickSync();
+				}),
+			);
+		});
+
 		new Notice("Multi-Device Sync 已載入");
 	}
 
 	onunload() {
 		console.log("[multi-device-sync] plugin unloaded");
+		if (this.quickSyncDebounceTimer !== null) {
+			window.clearTimeout(this.quickSyncDebounceTimer);
+			this.quickSyncDebounceTimer = null;
+		}
 	}
 
 	async loadSettings() {
@@ -423,8 +458,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		].join("\n");
 	}
 
+	private isConfigured(): boolean {
+		return !!parseGithubRepoUrl(this.settings.repoUrl) && !!this.settings.token;
+	}
+
 	private checkConfigured(): boolean {
-		if (!parseGithubRepoUrl(this.settings.repoUrl) || !this.settings.token) {
+		if (!this.isConfigured()) {
 			new Notice("請先到 Multi-Device Sync 設定頁填好 repository 網址 / token");
 			return false;
 		}
@@ -693,6 +732,62 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// 自動觸發用的安靜版本：開啟時、定時、新增/刪除/改名事件都走這條路。
+	// 不開進度視窗，沒有變化就完全不出聲，避免每 10 分鐘或每次存檔都跳提示。
+	async quickSync() {
+		if (!this.isConfigured()) return;
+		if (this.syncing) return;
+
+		this.syncing = true;
+		try {
+			const { remoteTree, localShas, result } = await this.computeDiffNow();
+			const pushed = await this.applyPush(result.toPush, localShas);
+
+			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
+			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath);
+
+			const { result: finalResult } = await this.computeDiffNow();
+			await this.writeReport(finalResult);
+
+			if (pushed > 0 || pulled > 0 || pullFailed > 0 || finalResult.conflicts.length > 0) {
+				const parts = [`推送 ${pushed}`, `拉取 ${pulled}${pullFailed > 0 ? `（失敗 ${pullFailed}）` : ""}`];
+				if (finalResult.conflicts.length > 0) parts.push(`⚠️ ${finalResult.conflicts.length} 個衝突`);
+				new Notice(`Quick Sync：${parts.join("、")}`);
+			}
+
+			if (finalResult.conflicts.length > 0) {
+				new ConflictModal(this.app, this, finalResult.conflicts).open();
+			}
+		} catch (error) {
+			console.error("[multi-device-sync] quick sync failed", error);
+			new Notice(`Quick Sync 失敗：${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.syncing = false;
+		}
+	}
+
+	// 新增/刪除/改名事件的防抖動：短時間內連續觸發只會在最後一次之後跑一次。
+	private scheduleQuickSync(delayMs = 3000) {
+		if (this.quickSyncDebounceTimer !== null) {
+			window.clearTimeout(this.quickSyncDebounceTimer);
+		}
+		this.quickSyncDebounceTimer = window.setTimeout(() => {
+			this.quickSyncDebounceTimer = null;
+			this.quickSync();
+		}, delayMs);
+	}
+
+	// 依設定的分鐘數重新建立定時同步；設定變更時也要呼叫這個換成新的間隔。
+	setupSyncInterval() {
+		if (this.syncIntervalId !== null) {
+			window.clearInterval(this.syncIntervalId);
+			this.syncIntervalId = null;
+		}
+		const minutes = Math.min(MAX_SYNC_INTERVAL_MINUTES, Math.max(MIN_SYNC_INTERVAL_MINUTES, this.settings.syncIntervalMinutes));
+		this.syncIntervalId = window.setInterval(() => this.quickSync(), minutes * 60 * 1000);
+		this.registerInterval(this.syncIntervalId);
+	}
+
 	// 單一檔案的衝突解決：選一邊，直接以那一邊的內容覆蓋另一邊。
 	async resolveConflict(path: string, keep: "local" | "remote") {
 		if (keep === "local") {
@@ -887,5 +982,22 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 					await this.plugin.validateToken(tokenStatus);
 				}),
 			);
+
+		new Setting(containerEl)
+			.setName("定時同步間隔（分鐘）")
+			.setDesc(`${MIN_SYNC_INTERVAL_MINUTES}~${MAX_SYNC_INTERVAL_MINUTES} 分鐘，預設 10。開啟時、以及新增/刪除/改名檔案時也會另外觸發一次 Quick Sync`)
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = String(MIN_SYNC_INTERVAL_MINUTES);
+				text.inputEl.max = String(MAX_SYNC_INTERVAL_MINUTES);
+				text.setValue(String(this.plugin.settings.syncIntervalMinutes)).onChange(async (value) => {
+					const parsed = Number(value);
+					if (!Number.isFinite(parsed)) return;
+					const clamped = Math.min(MAX_SYNC_INTERVAL_MINUTES, Math.max(MIN_SYNC_INTERVAL_MINUTES, Math.round(parsed)));
+					this.plugin.settings.syncIntervalMinutes = clamped;
+					await this.plugin.saveSettings();
+					this.plugin.setupSyncInterval();
+				});
+			});
 	}
 }
