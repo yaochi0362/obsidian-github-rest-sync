@@ -65,16 +65,22 @@ class ProgressModal extends Modal {
 	}
 }
 
+// 上次同步完成後，本機跟 GitHub 都一致的版本（path -> sha）。
+// 用來分辨「這是新檔案」還是「這是被刪掉的檔案」——單看目前兩邊有沒有這個檔案是分不出來的。
+type SyncState = Record<string, string>;
+
 interface MultiDeviceSyncSettings {
 	repoUrl: string;
 	branch: string;
 	token: string;
+	syncState: SyncState;
 }
 
 const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
 	repoUrl: "",
 	branch: "main",
 	token: "",
+	syncState: {},
 };
 
 interface ParsedRepo {
@@ -105,10 +111,17 @@ interface GitTreeEntry {
 	size?: number;
 }
 
+type ChangeAction = "create" | "modify" | "delete";
+
+interface PlannedChange {
+	path: string;
+	action: ChangeAction;
+}
+
 interface DiffResult {
-	onlyLocal: string[];
-	onlyRemote: string[];
-	differs: string[];
+	toPush: PlannedChange[]; // 本機動過、GitHub 沒動：套用到 GitHub
+	toPull: PlannedChange[]; // GitHub 動過、本機沒動：套用到本機
+	conflicts: string[]; // 兩邊都動過，而且動的不一樣：不自動處理
 	inSyncCount: number;
 }
 
@@ -183,12 +196,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			this.runDryRun();
 		});
 
-		this.addRibbonIcon("download", "Multi-Device Sync：拉取只在 GitHub 上的新檔案", () => {
-			this.pullNewFiles();
+		this.addRibbonIcon("download", "Multi-Device Sync：拉取變更（含新增/修改/刪除）", () => {
+			this.pullChanges();
 		});
 
-		this.addRibbonIcon("upload", "Multi-Device Sync：推送只在本機的新檔案", () => {
-			this.pushNewFiles();
+		this.addRibbonIcon("upload", "Multi-Device Sync：推送變更（含新增/修改/刪除）", () => {
+			this.pushChanges();
 		});
 
 		this.addCommand({
@@ -207,14 +220,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "multi-device-sync-pull-new",
-			name: "Multi-Device Sync: 拉取只在 GitHub 上的新檔案",
-			callback: () => this.pullNewFiles(),
+			name: "Multi-Device Sync: 拉取變更（含新增/修改/刪除）",
+			callback: () => this.pullChanges(),
 		});
 
 		this.addCommand({
 			id: "multi-device-sync-push-new",
-			name: "Multi-Device Sync: 推送只在本機的新檔案",
-			callback: () => this.pushNewFiles(),
+			name: "Multi-Device Sync: 推送變更（含新增/修改/刪除）",
+			callback: () => this.pushChanges(),
 		});
 
 		new Notice("Multi-Device Sync 已載入");
@@ -321,36 +334,71 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return result;
 	}
 
+	// 三方比對（跟 git 判斷要不要衝突同一套邏輯）：拿「上次同步後雙方一致的版本」當基準，
+	// 只有一邊變動就能安全地自動套用到另一邊，兩邊都變動而且變得不一樣才是真衝突。
+	// 同時會把 syncState 裡「兩邊都已經一致」的項目補起來（自我修復，不管是不是本來就在裡面）。
 	private diff(remoteTree: GitTreeEntry[], localShas: Map<string, string>): DiffResult {
 		const remoteByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-		const onlyLocal: string[] = [];
-		const onlyRemote: string[] = [];
-		const differs: string[] = [];
+		const syncState = this.settings.syncState;
+		const allPaths = new Set<string>([...localShas.keys(), ...remoteByPath.keys(), ...Object.keys(syncState)]);
+
+		const toPush: PlannedChange[] = [];
+		const toPull: PlannedChange[] = [];
+		const conflicts: string[] = [];
 		let inSyncCount = 0;
+		let syncStateChanged = false;
 
-		for (const [path, localSha] of localShas) {
-			const remoteSha = remoteByPath.get(path);
-			if (remoteSha === undefined) {
-				onlyLocal.push(path);
-			} else if (remoteSha !== localSha) {
-				differs.push(path);
-			} else {
-				inSyncCount++;
+		for (const path of allPaths) {
+			const local = localShas.get(path);
+			const remote = remoteByPath.get(path);
+			const base = syncState[path];
+
+			if (local === remote) {
+				if (local === undefined) {
+					if (path in syncState) {
+						delete syncState[path];
+						syncStateChanged = true;
+					}
+				} else {
+					inSyncCount++;
+					if (syncState[path] !== local) {
+						syncState[path] = local;
+						syncStateChanged = true;
+					}
+				}
+				continue;
 			}
-			remoteByPath.delete(path);
-		}
-		for (const path of remoteByPath.keys()) {
-			onlyRemote.push(path);
+
+			const localChanged = local !== base;
+			const remoteChanged = remote !== base;
+
+			if (localChanged && !remoteChanged) {
+				toPush.push({ path, action: local === undefined ? "delete" : base === undefined ? "create" : "modify" });
+			} else if (remoteChanged && !localChanged) {
+				toPull.push({ path, action: remote === undefined ? "delete" : base === undefined ? "create" : "modify" });
+			} else {
+				conflicts.push(path);
+			}
 		}
 
-		onlyLocal.sort();
-		onlyRemote.sort();
-		differs.sort();
-		return { onlyLocal, onlyRemote, differs, inSyncCount };
+		if (syncStateChanged) {
+			// 不 await：這只是把自我修復的結果存起來，不影響這次比對結果
+			void this.saveSettings();
+		}
+
+		toPush.sort((a, b) => a.path.localeCompare(b.path));
+		toPull.sort((a, b) => a.path.localeCompare(b.path));
+		conflicts.sort();
+		return { toPush, toPull, conflicts, inSyncCount };
 	}
 
 	private buildReportMarkdown(result: DiffResult): string {
-		const section = (title: string, items: string[]) =>
+		const actionLabel: Record<ChangeAction, string> = { create: "新增", modify: "修改", delete: "刪除" };
+		const changeSection = (title: string, items: PlannedChange[]) =>
+			items.length > 0
+				? `## ${title}（${items.length}）\n${items.map((c) => `- [${actionLabel[c.action]}] ${c.path}`).join("\n")}\n`
+				: `## ${title}（0）\n（無）\n`;
+		const pathSection = (title: string, items: string[]) =>
 			items.length > 0
 				? `## ${title}（${items.length}）\n${items.map((p) => `- ${p}`).join("\n")}\n`
 				: `## ${title}（0）\n（無）\n`;
@@ -361,9 +409,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			`產生時間：${new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}`,
 			`已同步（內容一致）：${result.inSyncCount} 個檔案`,
 			``,
-			section("只存在本機，GitHub 上沒有（需要推上去）", result.onlyLocal),
-			section("只存在 GitHub，本機沒有（需要拉下來）", result.onlyRemote),
-			section("兩邊都有，但內容不同（需要人工判斷留哪一份）", result.differs),
+			changeSection("只有本機動過，會推上 GitHub", result.toPush),
+			changeSection("只有 GitHub 動過，會拉回本機", result.toPull),
+			pathSection("兩邊都動過，而且動的不一樣（需要人工判斷留哪一份）", result.conflicts),
 			``,
 			`> 這份報告只讀不寫，沒有任何檔案被實際同步或覆蓋。`,
 		].join("\n");
@@ -377,10 +425,23 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return true;
 	}
 
-	private async computeDiffNow(): Promise<{ remoteTree: GitTreeEntry[]; result: DiffResult }> {
+	private async computeDiffNow(): Promise<{ remoteTree: GitTreeEntry[]; localShas: Map<string, string>; result: DiffResult }> {
 		const [remoteTree, localShas] = await Promise.all([this.fetchRemoteTree(), this.computeLocalShas()]);
 		const result = this.diff(remoteTree, localShas);
-		return { remoteTree, result };
+		return { remoteTree, localShas, result };
+	}
+
+	// push/pull 成功套用一批變更之後，把 syncState 更新成「雙方現在的共同版本」。
+	private async recordSynced(changes: PlannedChange[], newShaFor: (path: string) => string | undefined) {
+		for (const change of changes) {
+			if (change.action === "delete") {
+				delete this.settings.syncState[change.path];
+			} else {
+				const sha = newShaFor(change.path);
+				if (sha) this.settings.syncState[change.path] = sha;
+			}
+		}
+		await this.saveSettings();
 	}
 
 	private async writeReport(result: DiffResult) {
@@ -451,30 +512,37 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 	// 文字檔直接把內容塞進 tree entry（GitHub 會自動幫你建 blob），
 	// 二進位檔（圖片、PDF 等）才需要先呼叫 blobs API 拿 sha。
-	private async buildTreeEntry(path: string): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string }> {
-		const bytes = await this.app.vault.adapter.readBinary(path);
+	// 刪除則是 sha: null——GitHub tree API 用這個表示「從 base_tree 繼承的內容裡把這個路徑移除」。
+	private async buildTreeEntry(
+		change: PlannedChange,
+	): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string | null }> {
+		if (change.action === "delete") {
+			return { path: change.path, mode: "100644", type: "blob", sha: null };
+		}
+
+		const bytes = await this.app.vault.adapter.readBinary(change.path);
 		const text = this.decodeAsUtf8IfPossible(bytes);
 		if (text !== null) {
-			return { path, mode: "100644", type: "blob", content: text };
+			return { path: change.path, mode: "100644", type: "blob", content: text };
 		}
 		const blobRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/blobs`, "POST", {
 			content: arrayBufferToBase64(bytes),
 			encoding: "base64",
 		});
 		if (blobRes.status !== 201) throw new Error(`建立 blob 失敗 (${blobRes.status}): ${blobRes.text}`);
-		return { path, mode: "100644", type: "blob", sha: blobRes.json.sha };
+		return { path: change.path, mode: "100644", type: "blob", sha: blobRes.json.sha };
 	}
 
-	// 把一批檔案打包成「一個」commit：建 tree（掛在 base_tree 上）→ 建 commit → 更新 branch ref。
+	// 把一批變更（新增/修改/刪除）打包成「一個」commit：建 tree（掛在 base_tree 上）→ 建 commit → 更新 branch ref。
 	// 回傳新的 commit/tree sha，供下一批接續使用（每批之後都要 fast-forward，不然下一批的 base_tree 會過時）。
 	private async commitBatch(
-		paths: string[],
+		changes: PlannedChange[],
 		base: { commitSha: string; treeSha: string } | null,
 		retriesLeft = 2,
 	): Promise<{ commitSha: string; treeSha: string }> {
 		const entries = [];
-		for (const path of paths) {
-			entries.push(await this.buildTreeEntry(path));
+		for (const change of changes) {
+			entries.push(await this.buildTreeEntry(change));
 		}
 
 		const treeRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/trees`, "POST", {
@@ -485,7 +553,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const newTreeSha = treeRes.json.sha;
 
 		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
-			message: `Multi-Device Sync: add ${paths.length} files`,
+			message: `Multi-Device Sync: sync ${changes.length} files`,
 			tree: newTreeSha,
 			...(base ? { parents: [base.commitSha] } : {}),
 		});
@@ -507,7 +575,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		// 重新讀一次目前的 head，用新的 base 重做這批 tree+commit 再試一次。
 		if ((refRes.status === 422 || refRes.status === 409) && retriesLeft > 0) {
 			const freshBase = await this.getBranchHead();
-			return this.commitBatch(paths, freshBase, retriesLeft - 1);
+			return this.commitBatch(changes, freshBase, retriesLeft - 1);
 		}
 
 		throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
@@ -522,38 +590,46 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			modal.setMessage("寫入比對報告…");
 			await this.writeReport(result);
 
-			return `比對完成：一致 ${result.inSyncCount}、只在本機 ${result.onlyLocal.length}、只在雲端 ${result.onlyRemote.length}、內容不同 ${result.differs.length}。詳情請看「多裝置同步報告」筆記`;
+			return `比對完成：一致 ${result.inSyncCount}、要拉下來 ${result.toPull.length}、要推上去 ${result.toPush.length}、衝突 ${result.conflicts.length}。詳情請看「多裝置同步報告」筆記`;
 		});
 	}
 
-	async pullNewFiles() {
+	async pullChanges() {
 		if (!this.checkConfigured()) return;
 
-		await this.withProgress("拉取新檔案", async (modal) => {
+		await this.withProgress("拉取變更", async (modal) => {
 			modal.setMessage("比對中…");
 			const { remoteTree, result } = await this.computeDiffNow();
-			if (result.onlyRemote.length === 0) {
+			if (result.toPull.length === 0) {
 				await this.writeReport(result);
-				return "沒有需要拉取的新檔案";
+				return "沒有需要拉取的變更";
 			}
 
 			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
 			let done = 0;
 			let failed = 0;
-			for (const path of result.onlyRemote) {
-				modal.setMessage(`拉取中… ${done + failed}/${result.onlyRemote.length}\n${path}`);
+			const succeeded: PlannedChange[] = [];
+			for (const change of result.toPull) {
+				modal.setMessage(`拉取中… ${done + failed}/${result.toPull.length}\n[${change.action}] ${change.path}`);
 				try {
-					const sha = shaByPath.get(path);
-					if (!sha) continue;
-					const bytes = await this.fetchBlobContent(sha);
-					await this.ensureParentFolder(path);
-					await this.app.vault.adapter.writeBinary(path, bytes);
+					if (change.action === "delete") {
+						await this.app.vault.adapter.remove(change.path);
+					} else {
+						const sha = shaByPath.get(change.path);
+						if (!sha) continue;
+						const bytes = await this.fetchBlobContent(sha);
+						await this.ensureParentFolder(change.path);
+						await this.app.vault.adapter.writeBinary(change.path, bytes);
+					}
+					succeeded.push(change);
 					done++;
 				} catch (error) {
 					failed++;
-					console.error(`[multi-device-sync] pull failed for ${path}`, error);
+					console.error(`[multi-device-sync] pull failed for ${change.path}`, error);
 				}
 			}
+
+			await this.recordSynced(succeeded, (path) => shaByPath.get(path));
 
 			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
@@ -562,28 +638,29 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		});
 	}
 
-	async pushNewFiles() {
+	async pushChanges() {
 		if (!this.checkConfigured()) return;
 
 		const PUSH_BATCH_SIZE = 200;
-		await this.withProgress("推送新檔案", async (modal) => {
+		await this.withProgress("推送變更", async (modal) => {
 			modal.setMessage("比對中…");
-			const { result } = await this.computeDiffNow();
-			if (result.onlyLocal.length === 0) {
+			const { localShas, result } = await this.computeDiffNow();
+			if (result.toPush.length === 0) {
 				await this.writeReport(result);
-				return "沒有需要推送的新檔案";
+				return "沒有需要推送的變更";
 			}
 
-			const batches: string[][] = [];
-			for (let i = 0; i < result.onlyLocal.length; i += PUSH_BATCH_SIZE) {
-				batches.push(result.onlyLocal.slice(i, i + PUSH_BATCH_SIZE));
+			const batches: PlannedChange[][] = [];
+			for (let i = 0; i < result.toPush.length; i += PUSH_BATCH_SIZE) {
+				batches.push(result.toPush.slice(i, i + PUSH_BATCH_SIZE));
 			}
 
 			let head = await this.getBranchHead();
 			let done = 0;
 			for (let i = 0; i < batches.length; i++) {
-				modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${result.onlyLocal.length} 個檔案）`);
+				modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${result.toPush.length} 個檔案）`);
 				head = await this.commitBatch(batches[i], head);
+				await this.recordSynced(batches[i], (path) => localShas.get(path));
 				done += batches[i].length;
 			}
 
