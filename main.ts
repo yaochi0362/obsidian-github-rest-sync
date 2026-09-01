@@ -192,16 +192,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 		this.addSettingTab(new MultiDeviceSyncSettingTab(this.app, this));
 
-		this.addRibbonIcon("refresh-cw", "Multi-Device Sync：比對雲端與本機差異", () => {
-			this.runDryRun();
-		});
-
-		this.addRibbonIcon("download", "Multi-Device Sync：拉取變更（含新增/修改/刪除）", () => {
-			this.pullChanges();
-		});
-
-		this.addRibbonIcon("upload", "Multi-Device Sync：推送變更（含新增/修改/刪除）", () => {
-			this.pushChanges();
+		this.addRibbonIcon("refresh-cw", "Multi-Device Sync：一鍵同步", () => {
+			this.syncAll();
 		});
 
 		this.addCommand({
@@ -213,21 +205,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "multi-device-sync-dry-run",
-			name: "Multi-Device Sync: 比對雲端與本機差異（不會寫入任何檔案）",
-			callback: () => this.runDryRun(),
-		});
-
-		this.addCommand({
-			id: "multi-device-sync-pull-new",
-			name: "Multi-Device Sync: 拉取變更（含新增/修改/刪除）",
-			callback: () => this.pullChanges(),
-		});
-
-		this.addCommand({
-			id: "multi-device-sync-push-new",
-			name: "Multi-Device Sync: 推送變更（含新增/修改/刪除）",
-			callback: () => this.pushChanges(),
+			id: "multi-device-sync-all",
+			name: "Multi-Device Sync: 一鍵同步（推送＋拉取）",
+			callback: () => this.syncAll(),
 		});
 
 		new Notice("Multi-Device Sync 已載入");
@@ -581,108 +561,97 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
 	}
 
-	async runDryRun() {
-		if (!this.checkConfigured()) return;
+	private async applyPush(changes: PlannedChange[], localShas: Map<string, string>, modal: ProgressModal): Promise<number> {
+		const PUSH_BATCH_SIZE = 200;
+		if (changes.length === 0) return 0;
 
-		await this.withProgress("比對雲端與本機差異", async (modal) => {
-			modal.setMessage("讀取本機與 GitHub 檔案清單…");
-			const { result } = await this.computeDiffNow();
-			modal.setMessage("寫入比對報告…");
-			await this.writeReport(result);
+		const batches: PlannedChange[][] = [];
+		for (let i = 0; i < changes.length; i += PUSH_BATCH_SIZE) {
+			batches.push(changes.slice(i, i + PUSH_BATCH_SIZE));
+		}
 
-			return `比對完成：一致 ${result.inSyncCount}、要拉下來 ${result.toPull.length}、要推上去 ${result.toPush.length}、衝突 ${result.conflicts.length}。詳情請看「多裝置同步報告」筆記`;
-		});
+		let head = await this.getBranchHead();
+		let done = 0;
+		for (let i = 0; i < batches.length; i++) {
+			modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			head = await this.commitBatch(batches[i], head);
+			await this.recordSynced(batches[i], (path) => localShas.get(path));
+			done += batches[i].length;
+		}
+		return done;
 	}
 
-	async pullChanges() {
+	private async applyPull(
+		changes: PlannedChange[],
+		shaByPath: Map<string, string>,
+		modal: ProgressModal,
+	): Promise<{ done: number; failed: number }> {
+		const PULL_BATCH_SIZE = 20; // 每批平行抓取，批次之間依序，避免一次開太多平行請求
+		if (changes.length === 0) return { done: 0, failed: 0 };
+
+		const batches: PlannedChange[][] = [];
+		for (let i = 0; i < changes.length; i += PULL_BATCH_SIZE) {
+			batches.push(changes.slice(i, i + PULL_BATCH_SIZE));
+		}
+
+		let done = 0;
+		let failed = 0;
+		for (let i = 0; i < batches.length; i++) {
+			modal.setMessage(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			const batch = batches[i];
+			const outcomes = await Promise.allSettled(
+				batch.map(async (change) => {
+					if (change.action === "delete") {
+						await this.app.vault.adapter.remove(change.path);
+					} else {
+						const sha = shaByPath.get(change.path);
+						if (!sha) throw new Error("找不到對應的 blob sha");
+						const bytes = await this.fetchBlobContent(sha);
+						await this.ensureParentFolder(change.path);
+						await this.app.vault.adapter.writeBinary(change.path, bytes);
+					}
+					return change;
+				}),
+			);
+
+			const succeeded: PlannedChange[] = [];
+			for (const outcome of outcomes) {
+				if (outcome.status === "fulfilled") {
+					succeeded.push(outcome.value);
+					done++;
+				} else {
+					failed++;
+					console.error("[multi-device-sync] pull failed", outcome.reason);
+				}
+			}
+			// 每批結束就存一次記錄——就算之後被中斷，這批已經成功的也不用重拉
+			await this.recordSynced(succeeded, (path) => shaByPath.get(path));
+		}
+		return { done, failed };
+	}
+
+	// 唯一對外的同步入口：比對 → 推送本機獨有的變更 → 拉取 GitHub 獨有的變更 → 回報衝突。
+	async syncAll() {
 		if (!this.checkConfigured()) return;
 
-		const PULL_BATCH_SIZE = 20; // 每批平行抓取，批次之間依序，避免一次開太多平行請求
-		await this.withProgress("拉取變更", async (modal) => {
+		await this.withProgress("一鍵同步", async (modal) => {
 			modal.setMessage("比對中…");
-			const { remoteTree, result } = await this.computeDiffNow();
-			if (result.toPull.length === 0) {
-				await this.writeReport(result);
-				return "沒有需要拉取的變更";
-			}
+			const { remoteTree, localShas, result } = await this.computeDiffNow();
+
+			const pushed = await this.applyPush(result.toPush, localShas, modal);
 
 			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-			const batches: PlannedChange[][] = [];
-			for (let i = 0; i < result.toPull.length; i += PULL_BATCH_SIZE) {
-				batches.push(result.toPull.slice(i, i + PULL_BATCH_SIZE));
-			}
-
-			let done = 0;
-			let failed = 0;
-			for (let i = 0; i < batches.length; i++) {
-				modal.setMessage(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${result.toPull.length} 個檔案）`);
-				const batch = batches[i];
-				const outcomes = await Promise.allSettled(
-					batch.map(async (change) => {
-						if (change.action === "delete") {
-							await this.app.vault.adapter.remove(change.path);
-						} else {
-							const sha = shaByPath.get(change.path);
-							if (!sha) throw new Error("找不到對應的 blob sha");
-							const bytes = await this.fetchBlobContent(sha);
-							await this.ensureParentFolder(change.path);
-							await this.app.vault.adapter.writeBinary(change.path, bytes);
-						}
-						return change;
-					}),
-				);
-
-				const succeeded: PlannedChange[] = [];
-				for (const outcome of outcomes) {
-					if (outcome.status === "fulfilled") {
-						succeeded.push(outcome.value);
-						done++;
-					} else {
-						failed++;
-						console.error("[multi-device-sync] pull failed", outcome.reason);
-					}
-				}
-				// 每批結束就存一次記錄——就算之後被中斷，這批已經成功的也不用重拉
-				await this.recordSynced(succeeded, (path) => shaByPath.get(path));
-			}
+			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath, modal);
 
 			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
-			return `拉取完成：成功 ${done} 個${failed > 0 ? `，失敗 ${failed} 個（詳情看 console）` : ""}`;
-		});
-	}
 
-	async pushChanges() {
-		if (!this.checkConfigured()) return;
-
-		const PUSH_BATCH_SIZE = 200;
-		await this.withProgress("推送變更", async (modal) => {
-			modal.setMessage("比對中…");
-			const { localShas, result } = await this.computeDiffNow();
-			if (result.toPush.length === 0) {
-				await this.writeReport(result);
-				return "沒有需要推送的變更";
+			const parts = [`推送 ${pushed} 個`, `拉取 ${pulled} 個${pullFailed > 0 ? `（失敗 ${pullFailed}）` : ""}`];
+			if (finalResult.conflicts.length > 0) {
+				parts.push(`⚠️ 還有 ${finalResult.conflicts.length} 個衝突需要人工處理，詳情看「多裝置同步報告」`);
 			}
-
-			const batches: PlannedChange[][] = [];
-			for (let i = 0; i < result.toPush.length; i += PUSH_BATCH_SIZE) {
-				batches.push(result.toPush.slice(i, i + PUSH_BATCH_SIZE));
-			}
-
-			let head = await this.getBranchHead();
-			let done = 0;
-			for (let i = 0; i < batches.length; i++) {
-				modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${result.toPush.length} 個檔案）`);
-				head = await this.commitBatch(batches[i], head);
-				await this.recordSynced(batches[i], (path) => localShas.get(path));
-				done += batches[i].length;
-			}
-
-			modal.setMessage("更新比對報告…");
-			const { result: finalResult } = await this.computeDiffNow();
-			await this.writeReport(finalResult);
-			return `推送完成：${done} 個檔案，共 ${batches.length} 個 commit`;
+			return `一鍵同步完成：${parts.join("、")}`;
 		});
 	}
 }
