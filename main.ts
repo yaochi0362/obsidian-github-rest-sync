@@ -587,7 +587,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		throw new Error(`更新 branch 失敗 (${refRes.status}): ${refRes.text}`);
 	}
 
-	private async applyPush(changes: PlannedChange[], localShas: Map<string, string>, modal: ProgressModal): Promise<number> {
+	private async applyPush(
+		changes: PlannedChange[],
+		localShas: Map<string, string>,
+		onProgress: (msg: string) => void = () => {},
+	): Promise<number> {
 		const PUSH_BATCH_SIZE = 200;
 		if (changes.length === 0) return 0;
 
@@ -599,7 +603,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let head = await this.getBranchHead();
 		let done = 0;
 		for (let i = 0; i < batches.length; i++) {
-			modal.setMessage(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			onProgress(`推送中… commit ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
 			head = await this.commitBatch(batches[i], head);
 			await this.recordSynced(batches[i], (path) => localShas.get(path));
 			done += batches[i].length;
@@ -610,7 +614,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private async applyPull(
 		changes: PlannedChange[],
 		shaByPath: Map<string, string>,
-		modal: ProgressModal,
+		onProgress: (msg: string) => void = () => {},
 	): Promise<{ done: number; failed: number }> {
 		const PULL_BATCH_SIZE = 20; // 每批平行抓取，批次之間依序，避免一次開太多平行請求
 		if (changes.length === 0) return { done: 0, failed: 0 };
@@ -623,7 +627,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let done = 0;
 		let failed = 0;
 		for (let i = 0; i < batches.length; i++) {
-			modal.setMessage(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
+			onProgress(`拉取中… 批次 ${i + 1}/${batches.length}（已完成 ${done}/${changes.length} 個檔案）`);
 			const batch = batches[i];
 			const outcomes = await Promise.allSettled(
 				batch.map(async (change) => {
@@ -656,29 +660,161 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return { done, failed };
 	}
 
-	// 唯一對外的同步入口：比對 → 推送本機獨有的變更 → 拉取 GitHub 獨有的變更 → 回報衝突。
+	// 唯一對外的同步入口：比對 → 推送本機獨有的變更 → 拉取 GitHub 獨有的變更 → 有衝突就跳出選擇視窗。
 	async syncAll() {
 		if (!this.checkConfigured()) return;
 
+		let conflicts: string[] = [];
 		await this.withProgress("一鍵同步", async (modal) => {
 			modal.setMessage("比對中…");
 			const { remoteTree, localShas, result } = await this.computeDiffNow();
 
-			const pushed = await this.applyPush(result.toPush, localShas, modal);
+			const pushed = await this.applyPush(result.toPush, localShas, (msg) => modal.setMessage(msg));
 
 			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath, modal);
+			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath, (msg) =>
+				modal.setMessage(msg),
+			);
 
 			modal.setMessage("更新比對報告…");
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
+			conflicts = finalResult.conflicts;
 
 			const parts = [`推送 ${pushed} 個`, `拉取 ${pulled} 個${pullFailed > 0 ? `（失敗 ${pullFailed}）` : ""}`];
-			if (finalResult.conflicts.length > 0) {
-				parts.push(`⚠️ 還有 ${finalResult.conflicts.length} 個衝突需要人工處理，詳情看「多裝置同步報告」`);
+			if (conflicts.length > 0) {
+				parts.push(`發現 ${conflicts.length} 個衝突，等等會跳出選擇視窗`);
 			}
 			return `一鍵同步完成：${parts.join("、")}`;
 		});
+
+		if (conflicts.length > 0) {
+			new ConflictModal(this.app, this, conflicts).open();
+		}
+	}
+
+	// 單一檔案的衝突解決：選一邊，直接以那一邊的內容覆蓋另一邊。
+	async resolveConflict(path: string, keep: "local" | "remote") {
+		if (keep === "local") {
+			const bytes = await this.app.vault.adapter.readBinary(path);
+			const sha = await gitBlobSha1(bytes);
+			await this.applyPush([{ path, action: "modify" }], new Map([[path, sha]]));
+		} else {
+			const remoteTree = await this.fetchRemoteTree();
+			const entry = remoteTree.find((e) => e.path === path);
+			if (!entry) throw new Error("GitHub 上找不到這個檔案，可能已經被刪除");
+			await this.applyPull([{ path, action: "modify" }], new Map([[path, entry.sha]]));
+		}
+	}
+
+	async readLocalPreview(path: string): Promise<string> {
+		try {
+			const bytes = await this.app.vault.adapter.readBinary(path);
+			const text = this.decodeAsUtf8IfPossible(bytes);
+			return text !== null ? text.slice(0, 300) : "（二進位檔案，無法預覽）";
+		} catch (error) {
+			return `（讀取失敗：${error instanceof Error ? error.message : String(error)}）`;
+		}
+	}
+
+	async readRemotePreview(path: string): Promise<string> {
+		try {
+			const remoteTree = await this.fetchRemoteTree();
+			const entry = remoteTree.find((e) => e.path === path);
+			if (!entry) return "（GitHub 上找不到這個檔案）";
+			const bytes = await this.fetchBlobContent(entry.sha);
+			const text = this.decodeAsUtf8IfPossible(bytes);
+			return text !== null ? text.slice(0, 300) : "（二進位檔案，無法預覽）";
+		} catch (error) {
+			return `（讀取失敗：${error instanceof Error ? error.message : String(error)}）`;
+		}
+	}
+}
+
+class ConflictModal extends Modal {
+	constructor(
+		app: App,
+		private plugin: MultiDeviceSyncPlugin,
+		private conflicts: string[],
+	) {
+		super(app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText(`有 ${this.conflicts.length} 個檔案衝突需要選擇`);
+		this.contentEl.createEl("div", {
+			text: "兩邊都改過同一個檔案，選一邊留下，另一邊會被覆蓋。",
+			cls: "setting-item-description",
+		});
+
+		for (const path of this.conflicts) {
+			await this.renderRow(path);
+		}
+	}
+
+	private async renderRow(path: string) {
+		const row = this.contentEl.createDiv();
+		row.style.border = "1px solid var(--background-modifier-border)";
+		row.style.borderRadius = "6px";
+		row.style.padding = "8px";
+		row.style.margin = "8px 0";
+
+		row.createEl("div", { text: path }).style.fontWeight = "bold";
+
+		const previewsEl = row.createDiv();
+		previewsEl.style.display = "grid";
+		previewsEl.style.gridTemplateColumns = "1fr 1fr";
+		previewsEl.style.gap = "8px";
+		previewsEl.style.margin = "8px 0";
+
+		const [localPreview, remotePreview] = await Promise.all([
+			this.plugin.readLocalPreview(path),
+			this.plugin.readRemotePreview(path),
+		]);
+
+		for (const [label, preview] of [
+			["本機", localPreview],
+			["GitHub", remotePreview],
+		] as const) {
+			const col = previewsEl.createDiv();
+			col.createEl("div", { text: label, cls: "setting-item-description" });
+			const pre = col.createEl("pre", { text: preview });
+			pre.style.whiteSpace = "pre-wrap";
+			pre.style.fontSize = "0.8em";
+			pre.style.maxHeight = "150px";
+			pre.style.overflow = "auto";
+			pre.style.background = "var(--background-secondary)";
+			pre.style.padding = "6px";
+			pre.style.borderRadius = "4px";
+		}
+
+		const buttonsEl = row.createDiv();
+		buttonsEl.style.display = "flex";
+		buttonsEl.style.gap = "8px";
+
+		const statusEl = row.createDiv();
+
+		const localBtn = buttonsEl.createEl("button", { text: "保留本機" });
+		const remoteBtn = buttonsEl.createEl("button", { text: "保留 GitHub" });
+
+		const resolve = async (keep: "local" | "remote") => {
+			localBtn.disabled = true;
+			remoteBtn.disabled = true;
+			statusEl.setText("處理中…");
+			try {
+				await this.plugin.resolveConflict(path, keep);
+				statusEl.setText(`✅ 已保留${keep === "local" ? "本機" : "GitHub"}版本`);
+				statusEl.style.color = "var(--text-success)";
+			} catch (error) {
+				statusEl.setText(`❌ 處理失敗：${error instanceof Error ? error.message : String(error)}`);
+				statusEl.style.color = "var(--text-error)";
+				localBtn.disabled = false;
+				remoteBtn.disabled = false;
+			}
+		};
+
+		localBtn.onclick = () => resolve("local");
+		remoteBtn.onclick = () => resolve("remote");
 	}
 }
 
