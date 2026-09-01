@@ -190,9 +190,31 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// BRAT 在手機上更新時，不一定會先正確卸載舊版本，導致舊版本註冊的 ribbon 項目
+	// 沒被清掉、每次改版都多疊一個。這裡不管上一輪乾不乾淨，都先主動清一次舊的。
+	private removeStaleRibbonIcons() {
+		document.querySelectorAll('[aria-label^="Multi-Device Sync"]').forEach((el) => el.remove());
+	}
+
+	// 同樣道理，指令 id 曾經在不同版本被重複使用/移除過，直接用 app 內部 API 依 id 清掉，
+	// 不依賴前一輪 onunload 有沒有正常執行。
+	private removeStaleCommands() {
+		const staleIds = ["multi-device-sync-dry-run", "multi-device-sync-pull-new", "multi-device-sync-push-new"];
+		const commands = (this.app as unknown as { commands: { removeCommand: (id: string) => void } }).commands;
+		for (const id of staleIds) {
+			try {
+				commands.removeCommand(`${this.manifest.id}:${id}`);
+			} catch {
+				// 本來就沒有這個指令的話會丟錯，忽略即可
+			}
+		}
+	}
+
 	async onload() {
 		console.log("[multi-device-sync] plugin loaded");
 		await this.loadSettings();
+		this.removeStaleRibbonIcons();
+		this.removeStaleCommands();
 
 		this.addSettingTab(new MultiDeviceSyncSettingTab(this.app, this));
 
