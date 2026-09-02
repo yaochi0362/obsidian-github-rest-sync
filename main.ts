@@ -673,19 +673,31 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			...(base ? { base_tree: base.treeSha } : {}),
 		});
 		if (treeRes.status !== 201) {
-			// 422 here (often "GitRPC::BadObjectState") usually means base_tree is stale - e.g. a
-			// delete entry no longer matches what's actually in the tree we're building on
-			// because the branch moved after we read it. Same fix as the ref-update race below:
-			// refetch the head and retry the whole batch against a fresh base.
+			// 422 here is usually "GitRPC::BadObjectState" - base_tree went stale because the branch
+			// moved after we read it. Keep retrying on any 422 regardless of the exact message: a
+			// retry just refetches the head and rebuilds the batch, which is harmless even if the
+			// real cause turns out not to be staleness - it only costs a few extra seconds before
+			// surfacing the real error below.
 			if (treeRes.status === 422 && retriesLeft > 0) {
 				await sleep(retryJitterMs());
 				const freshBase = await this.getBranchHead();
 				return this.commitBatch(changes, freshBase, retriesLeft - 1);
 			}
-			throw new Error(
-				`Another device is syncing at the same time and this batch couldn't catch up after several retries. ` +
-					`Nothing was lost - just run sync again in a moment. (${treeRes.status}: ${treeRes.text})`,
+			console.error(
+				"[github-rest-sync] tree creation failed for paths:",
+				changes.map((c) => c.path),
 			);
+			// Only claim "another device" once retries are exhausted AND the message actually
+			// matches that known signature - otherwise show GitHub's real error so a genuine,
+			// non-race problem (e.g. a malformed path in one of the entries above) isn't hidden
+			// behind a guess.
+			if (treeRes.status === 422 && /BadObjectState/i.test(treeRes.text)) {
+				throw new Error(
+					`Another device is syncing at the same time and this batch couldn't catch up after several retries. ` +
+						`Nothing was lost - just run sync again in a moment. (${treeRes.status}: ${treeRes.text})`,
+				);
+			}
+			throw new Error(`Failed to create tree (${treeRes.status}): ${treeRes.text}`);
 		}
 		const newTreeSha = treeRes.json.sha;
 
