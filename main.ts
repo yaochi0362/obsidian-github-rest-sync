@@ -777,9 +777,23 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			return `One-Click Sync complete: ${parts.join(", ")}`;
 		});
 
-		if (conflicts.length > 0) {
-			new ConflictModal(this.app, this, conflicts).open();
-		}
+		// Keep the lock held for the whole conflict-resolution window: otherwise the periodic
+		// timer or a create/delete/rename event could run another sync while the modal is open
+		// and change what "the GitHub version" even means before the user clicks a button.
+		this.openConflictModalLocked(conflicts);
+	}
+
+	// Holds the sync lock until the modal closes (resolved or dismissed), so no other automatic
+	// or manual sync can run underneath a pending conflict decision.
+	private openConflictModalLocked(conflicts: string[]) {
+		if (conflicts.length === 0) return;
+		this.syncing = true;
+		new ConflictModal(this.app, this, conflicts).open();
+	}
+
+	// Called by ConflictModal when it closes, whatever the reason (resolved or dismissed).
+	releaseSyncLock() {
+		this.syncing = false;
 	}
 
 	// The quiet variant used for automatic triggers: on open, on the timer, and on
@@ -791,6 +805,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		if (this.syncing) return;
 
 		this.syncing = true;
+		let conflicts: string[] = [];
 		try {
 			const { remoteTree, localShas, result } = await this.computeDiffNow();
 			const pushed = await this.applyPush(result.toPush, localShas);
@@ -800,15 +815,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 			const { result: finalResult } = await this.computeDiffNow();
 			await this.writeReport(finalResult);
+			conflicts = finalResult.conflicts;
 
 			if (pushed > 0 || pulled > 0 || pullFailed > 0 || finalResult.conflicts.length > 0) {
 				const parts = [`Pushed ${pushed}`, `Pulled ${pulled}${pullFailed > 0 ? ` (${pullFailed} failed)` : ""}`];
 				if (finalResult.conflicts.length > 0) parts.push(`⚠️ ${finalResult.conflicts.length} conflict(s)`);
 				new Notice(`Quick Sync: ${parts.join(", ")}`);
-			}
-
-			if (finalResult.conflicts.length > 0) {
-				new ConflictModal(this.app, this, finalResult.conflicts).open();
 			}
 		} catch (error) {
 			console.error("[multi-device-sync] quick sync failed", error);
@@ -816,6 +828,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		} finally {
 			this.syncing = false;
 		}
+
+		// Opened after the finally block releases the lock above, then immediately re-locks for
+		// the duration of the modal - see openConflictModalLocked.
+		this.openConflictModalLocked(conflicts);
 	}
 
 	// Debounce for create/delete/rename events: a burst of triggers in a short window collapses
@@ -901,6 +917,13 @@ class ConflictModal extends Modal {
 		}
 	}
 
+	// Holds the sync lock for as long as this modal is open (see openConflictModalLocked), so
+	// release it however the modal ends up closing - resolved, dismissed, or left open when the
+	// app is closed.
+	onClose() {
+		this.plugin.releaseSyncLock();
+	}
+
 	private async renderRow(path: string) {
 		const row = this.contentEl.createDiv();
 		row.style.border = "1px solid var(--background-modifier-border)";
@@ -946,7 +969,7 @@ class ConflictModal extends Modal {
 		const localBtn = buttonsEl.createEl("button", { text: "Keep Local" });
 		const remoteBtn = buttonsEl.createEl("button", { text: "Keep GitHub" });
 
-		const resolve = async (keep: "local" | "remote") => {
+		const applyResolve = async (keep: "local" | "remote") => {
 			localBtn.disabled = true;
 			remoteBtn.disabled = true;
 			statusEl.setText("Applying…");
@@ -960,6 +983,35 @@ class ConflictModal extends Modal {
 				localBtn.disabled = false;
 				remoteBtn.disabled = false;
 			}
+		};
+
+		const resolve = async (keep: "local" | "remote") => {
+			if (keep === "remote") {
+				// This modal may have sat open for a while - if the local copy was edited since
+				// the preview above was captured, overwriting it with GitHub's version now would
+				// silently discard those newer edits. Confirm first.
+				const currentLocal = await this.plugin.readLocalPreview(path);
+				if (currentLocal !== localPreview) {
+					localBtn.disabled = true;
+					remoteBtn.disabled = true;
+					statusEl.setText("");
+					statusEl.style.color = "var(--text-warning)";
+					statusEl.createEl("div", {
+						text: "This file changed locally since this dialog opened. Keeping GitHub's version will discard those newer edits.",
+					});
+					const confirmBtn = statusEl.createEl("button", { text: "Discard local changes and continue" });
+					const cancelBtn = statusEl.createEl("button", { text: "Cancel" });
+					confirmBtn.style.marginRight = "8px";
+					confirmBtn.onclick = () => applyResolve("remote");
+					cancelBtn.onclick = () => {
+						statusEl.empty();
+						localBtn.disabled = false;
+						remoteBtn.disabled = false;
+					};
+					return;
+				}
+			}
+			await applyResolve(keep);
 		};
 
 		localBtn.onclick = () => resolve("local");
