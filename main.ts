@@ -118,8 +118,6 @@ function looksLikeGithubToken(token: string): boolean {
 
 const REPORT_FILE_PATH = normalizePath("GitHub REST Sync Report.md");
 
-// Path prefixes that are never synced: each device's own Obsidian config/cache.
-const EXCLUDED_PREFIXES = [".obsidian/", ".git/", ".trash/"];
 // Files that get regenerated with different content on every run: excluded from the diff,
 // otherwise they'd permanently show up as "content differs".
 const EXCLUDED_PATHS = [REPORT_FILE_PATH];
@@ -145,8 +143,17 @@ interface DiffResult {
 	inSyncCount: number;
 }
 
+// Any path with a dot-prefixed segment (.obsidian/, .git/, .trash/, .claude/, .vscode/, ...) is
+// never synced. This isn't just those three well-known folders: it matches Obsidian's own default
+// behavior of hiding dotfiles/dotfolders from the vault entirely, which is what made scanning via
+// this.app.vault.getFiles() safe before this plugin switched to a real filesystem walk (see
+// listAllFilePaths) - that switch fixed a staleness bug but also stopped getting this exclusion for
+// free, which is exactly how a git worktree checked out at .claude/worktrees/<name>/ (a real,
+// legitimate directory, just not vault content) ended up being diffed as ~1100 new files, including
+// a nested .git entry GitHub's tree API rejects outright as a malformed path component.
 function isExcluded(path: string): boolean {
-	return EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix)) || EXCLUDED_PATHS.includes(path);
+	if (EXCLUDED_PATHS.includes(path)) return true;
+	return path.split("/").some((segment) => segment.startsWith("."));
 }
 
 function sleep(ms: number): Promise<void> {
