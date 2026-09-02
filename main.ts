@@ -77,6 +77,11 @@ interface MultiDeviceSyncSettings {
 	token: string;
 	syncState: SyncState;
 	syncIntervalMinutes: number;
+	// False only for a device that has never completed a sync cycle. Gates the very first sync
+	// to pull-only (see runSyncCycle) so a fresh install - possibly with stale/orphaned local
+	// files that were already cleaned up elsewhere - doesn't push them back up as "new" before
+	// the user has had a chance to review what's actually local-only.
+	firstSyncDone: boolean;
 }
 
 const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
@@ -85,6 +90,7 @@ const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
 	token: "",
 	syncState: {},
 	syncIntervalMinutes: 10,
+	firstSyncDone: false,
 };
 
 const MIN_SYNC_INTERVAL_MINUTES = 1;
@@ -312,7 +318,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			if (this.manifest.id !== MultiDeviceSyncPlugin.OLD_PLUGIN_ID && (await this.app.vault.adapter.exists(oldDataPath))) {
 				try {
 					const oldData = JSON.parse(await this.app.vault.adapter.read(oldDataPath));
-					this.settings = Object.assign({}, DEFAULT_SETTINGS, oldData);
+					// Inheriting real sync history from the old plugin folder counts as already
+					// past the first-sync safety gate, regardless of whether that old data predates
+					// the firstSyncDone field.
+					this.settings = Object.assign({}, DEFAULT_SETTINGS, oldData, { firstSyncDone: true });
 					await this.saveSettings();
 					new Notice("Migrated settings and sync history from the previous plugin");
 					return;
@@ -322,6 +331,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			}
 		}
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, currentData);
+		// A device that already had saved settings before this field existed has already been
+		// syncing normally - only a device with no prior data.json at all is a true first install.
+		if (currentData && !("firstSyncDone" in currentData)) {
+			this.settings.firstSyncDone = true;
+		}
 	}
 
 	async saveSettings() {
@@ -766,29 +780,59 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return { done, failed };
 	}
 
-	// The single public sync entry point: diff -> push local-only changes -> pull GitHub-only
-	// changes -> open the resolution modal if there are conflicts.
+	// Diff -> push local-only changes -> pull GitHub-only changes -> refresh the report. Shared
+	// by both the manual One-Click Sync and the automatic Quick Sync so the first-sync safety
+	// gate below only has to live in one place.
+	//
+	// On a device's first-ever sync, local-only files are NOT pushed: a fresh install has no
+	// baseline (syncState) to tell "genuinely new file" apart from "stale file this device still
+	// has locally that was already deleted/moved on GitHub by another device" - e.g. installing
+	// on an old machine that still has pre-reorg loose files. Pulling first and reporting the
+	// local-only count lets the user review before anything gets uploaded; a second sync then
+	// pushes normally.
+	private async runSyncCycle(
+		onProgress: (msg: string) => void = () => {},
+	): Promise<{ pushed: number; pulled: number; pullFailed: number; conflicts: string[]; skippedPush: number }> {
+		onProgress("Comparing…");
+		const { remoteTree, localShas, result } = await this.computeDiffNow();
+
+		const isFirstSync = !this.settings.firstSyncDone;
+		const pushed = isFirstSync ? 0 : await this.applyPush(result.toPush, localShas, onProgress);
+		const skippedPush = isFirstSync ? result.toPush.length : 0;
+
+		const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
+		const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath, onProgress);
+
+		if (isFirstSync) {
+			this.settings.firstSyncDone = true;
+			await this.saveSettings();
+		}
+
+		onProgress("Updating diff report…");
+		const { result: finalResult } = await this.computeDiffNow();
+		await this.writeReport(finalResult);
+
+		return { pushed, pulled, pullFailed, conflicts: finalResult.conflicts, skippedPush };
+	}
+
+	// The single public manual sync entry point: run a sync cycle, then open the resolution
+	// modal if there are conflicts.
 	async syncAll() {
 		if (!this.checkConfigured()) return;
 
 		let conflicts: string[] = [];
 		await this.withProgress("One-Click Sync", async (modal) => {
-			modal.setMessage("Comparing…");
-			const { remoteTree, localShas, result } = await this.computeDiffNow();
-
-			const pushed = await this.applyPush(result.toPush, localShas, (msg) => modal.setMessage(msg));
-
-			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath, (msg) =>
+			const { pushed, pulled, pullFailed, conflicts: c, skippedPush } = await this.runSyncCycle((msg) =>
 				modal.setMessage(msg),
 			);
-
-			modal.setMessage("Updating diff report…");
-			const { result: finalResult } = await this.computeDiffNow();
-			await this.writeReport(finalResult);
-			conflicts = finalResult.conflicts;
+			conflicts = c;
 
 			const parts = [`Pushed ${pushed}`, `Pulled ${pulled}${pullFailed > 0 ? ` (${pullFailed} failed)` : ""}`];
+			if (skippedPush > 0) {
+				parts.push(
+					`⚠️ First sync on this device: ${skippedPush} local-only file(s) were NOT uploaded - review them, then sync again to push`,
+				);
+			}
 			if (conflicts.length > 0) {
 				parts.push(`Found ${conflicts.length} conflict(s) - a resolution dialog will open`);
 			}
@@ -825,19 +869,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		this.syncing = true;
 		let conflicts: string[] = [];
 		try {
-			const { remoteTree, localShas, result } = await this.computeDiffNow();
-			const pushed = await this.applyPush(result.toPush, localShas);
+			const { pushed, pulled, pullFailed, conflicts: c, skippedPush } = await this.runSyncCycle();
+			conflicts = c;
 
-			const shaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-			const { done: pulled, failed: pullFailed } = await this.applyPull(result.toPull, shaByPath);
-
-			const { result: finalResult } = await this.computeDiffNow();
-			await this.writeReport(finalResult);
-			conflicts = finalResult.conflicts;
-
-			if (pushed > 0 || pulled > 0 || pullFailed > 0 || finalResult.conflicts.length > 0) {
+			if (pushed > 0 || pulled > 0 || pullFailed > 0 || conflicts.length > 0 || skippedPush > 0) {
 				const parts = [`Pushed ${pushed}`, `Pulled ${pulled}${pullFailed > 0 ? ` (${pullFailed} failed)` : ""}`];
-				if (finalResult.conflicts.length > 0) parts.push(`⚠️ ${finalResult.conflicts.length} conflict(s)`);
+				if (skippedPush > 0) {
+					parts.push(`⚠️ First sync: ${skippedPush} local-only file(s) not uploaded yet - run sync again to push`);
+				}
+				if (conflicts.length > 0) parts.push(`⚠️ ${conflicts.length} conflict(s)`);
 				new Notice(`Quick Sync: ${parts.join(", ")}`);
 			}
 		} catch (error) {
