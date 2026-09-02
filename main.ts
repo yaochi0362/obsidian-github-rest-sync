@@ -421,13 +421,30 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return data.tree.filter((entry) => entry.type === "blob" && !isExcluded(entry.path));
 	}
 
+	// Walks the actual filesystem via the adapter, not this.app.vault.getFiles() (Obsidian's
+	// in-memory file index). The index is populated by Obsidian's own file-system watcher and can
+	// lag behind reality - a file written by something other than Obsidian's own file APIs (git
+	// checkout, an external tool, a restored backup) may sit on disk for a while before the index
+	// notices it. A diff built on a stale index can conclude a file that genuinely exists locally
+	// was "deleted", and push that deletion to GitHub. Reading the real directory tree removes that
+	// whole race - the diff's "local" side always matches what's actually on disk right now.
+	private async listAllFilePaths(dir = ""): Promise<string[]> {
+		const { files, folders } = await this.app.vault.adapter.list(dir);
+		const paths = [...files];
+		for (const folder of folders) {
+			if (isExcluded(`${folder}/`)) continue;
+			paths.push(...(await this.listAllFilePaths(folder)));
+		}
+		return paths;
+	}
+
 	private async computeLocalShas(): Promise<Map<string, string>> {
 		const result = new Map<string, string>();
-		const files = this.app.vault.getFiles();
-		for (const file of files) {
-			if (isExcluded(file.path)) continue;
-			const bytes = await this.app.vault.adapter.readBinary(file.path);
-			result.set(file.path, await gitBlobSha1(bytes));
+		const paths = await this.listAllFilePaths();
+		for (const path of paths) {
+			if (isExcluded(path)) continue;
+			const bytes = await this.app.vault.adapter.readBinary(path);
+			result.set(path, await gitBlobSha1(bytes));
 		}
 		return result;
 	}
