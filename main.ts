@@ -143,6 +143,16 @@ function isExcluded(path: string): boolean {
 	return EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix)) || EXCLUDED_PATHS.includes(path);
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Random delay before a branch-race retry: spreads out repeated collisions with another
+// device's push instead of retrying at the exact same instant every time.
+function retryJitterMs(): number {
+	return 300 + Math.floor(Math.random() * 500);
+}
+
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
 	const uint8 = new Uint8Array(bytes);
 	let binary = "";
@@ -620,7 +630,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private async commitBatch(
 		changes: PlannedChange[],
 		base: { commitSha: string; treeSha: string } | null,
-		retriesLeft = 2,
+		retriesLeft = 4,
 	): Promise<{ commitSha: string; treeSha: string }> {
 		const entries = [];
 		for (const change of changes) {
@@ -637,10 +647,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			// because the branch moved after we read it. Same fix as the ref-update race below:
 			// refetch the head and retry the whole batch against a fresh base.
 			if (treeRes.status === 422 && retriesLeft > 0) {
+				await sleep(retryJitterMs());
 				const freshBase = await this.getBranchHead();
 				return this.commitBatch(changes, freshBase, retriesLeft - 1);
 			}
-			throw new Error(`Failed to create tree (${treeRes.status}): ${treeRes.text}`);
+			throw new Error(
+				`Another device is syncing at the same time and this batch couldn't catch up after several retries. ` +
+					`Nothing was lost - just run sync again in a moment. (${treeRes.status}: ${treeRes.text})`,
+			);
 		}
 		const newTreeSha = treeRes.json.sha;
 
@@ -667,11 +681,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		// same time). Re-read the current head and redo this batch's tree+commit against the
 		// fresh base.
 		if ((refRes.status === 422 || refRes.status === 409) && retriesLeft > 0) {
+			await sleep(retryJitterMs());
 			const freshBase = await this.getBranchHead();
 			return this.commitBatch(changes, freshBase, retriesLeft - 1);
 		}
 
-		throw new Error(`Failed to update branch (${refRes.status}): ${refRes.text}`);
+		throw new Error(
+			`Another device is syncing at the same time and this batch couldn't catch up after several retries. ` +
+				`Nothing was lost - just run sync again in a moment. (${refRes.status}: ${refRes.text})`,
+		);
 	}
 
 	private async applyPush(

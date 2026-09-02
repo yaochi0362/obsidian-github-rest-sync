@@ -1,7 +1,7 @@
 {
 	"id": "github-rest-sync",
 	"name": "GitHub REST Sync",
-	"version": "0.0.23",
+	"version": "0.0.24",
 	"minAppVersion": "1.4.16",
 	"description": "Sync this vault with a GitHub repo via the REST API (no Node/git dependencies, mobile-safe).",
 	"author": "yaochi",
