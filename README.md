@@ -17,12 +17,13 @@ This plugin deliberately **avoids the git protocol entirely**. It calls GitHub's
 - **Pure REST API** - identical behavior on desktop, iOS, and Android; no system git required
 - **Three-way diff**: tracks "the version both sides agreed on after the last sync" so it can correctly tell apart new files, edits, and deletions. Renames are handled for free (they just look like a delete + a create to the diff logic)
 - **Conflict detection**: when both sides changed the same file differently, it never auto-overwrites - a resolution modal opens with a side-by-side content preview so you can pick which version to keep
+- **Never touches a file mid-edit**: any path modified in the last few seconds is skipped entirely for that sync cycle - not diffed, not pushed, not overwritten by a pull - and picked up again once it settles, so a sync can't catch content half-typed or overwrite it with an older version decided on before the edit happened
 - **Pull-only first sync**: a device's very first sync only pulls from GitHub and never pushes. A fresh install has no record of what was previously synced, so it can't tell a genuinely new local file apart from a stale one this device happens to still have (e.g. re-installing on an old machine that never got a folder reorg another device already pushed). Local-only files found on the first sync are reported but not uploaded - review them, then sync again to push normally
 - **Batched sync**: pushes are packed into a handful of commits via the git tree/commit API (not one commit per file), and pulls run in parallel batches - stays reliable even with a large number of files
 - **Automation**:
   - Syncs once automatically when the app opens
   - Periodic sync (defaults to every 10 minutes, adjustable to 1-1440 minutes in settings)
-  - Syncs automatically on file create/delete/rename, debounced by 3 seconds
+  - Syncs automatically on file create/edit/delete/rename, debounced by 3 seconds
   - All of the above are the quiet **Quick Sync** variant (no popup at all when nothing changed)
 - **Manual sync**: the ribbon icon / command palette entry is **Normal Sync**, which shows a progress modal while it runs
 

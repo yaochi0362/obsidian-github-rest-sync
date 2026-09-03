@@ -96,6 +96,11 @@ const DEFAULT_SETTINGS: MultiDeviceSyncSettings = {
 const MIN_SYNC_INTERVAL_MINUTES = 1;
 const MAX_SYNC_INTERVAL_MINUTES = 1440;
 
+// Debounce for create/modify/delete/rename events, and also the "still being edited" window a
+// sync excludes a path for - kept as one constant so they can't drift apart (see
+// recentlyModified above).
+const QUICK_SYNC_DEBOUNCE_MS = 3000;
+
 interface ParsedRepo {
 	owner: string;
 	repo: string;
@@ -201,6 +206,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private syncing = false;
 	private quickSyncDebounceTimer: number | null = null;
 	private syncIntervalId: number | null = null;
+	// path -> last time Obsidian told us it changed. A sync in progress reads this to skip any
+	// path still inside its settle window, so it never diffs/pushes/pulls a file mid-edit - the
+	// window matches the debounce delay below so a debounced sync's own trigger file has just
+	// cleared it by the time the sync actually runs.
+	private recentlyModified = new Map<string, number>();
 
 	// Single entry point: blocks overlapping runs (e.g. tapping the button again mid-batch-push
 	// would have both runs fast-forwarding the branch and stepping on each other), and keeps one
@@ -286,7 +296,16 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 
 			this.registerEvent(
 				this.app.vault.on("create", (file) => {
-					if (!isExcluded(file.path)) this.scheduleQuickSync();
+					if (isExcluded(file.path)) return;
+					this.markRecentlyModified(file.path);
+					this.scheduleQuickSync();
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("modify", (file) => {
+					if (isExcluded(file.path)) return;
+					this.markRecentlyModified(file.path);
+					this.scheduleQuickSync();
 				}),
 			);
 			this.registerEvent(
@@ -296,7 +315,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			);
 			this.registerEvent(
 				this.app.vault.on("rename", (file, oldPath) => {
-					if (!isExcluded(file.path) || !isExcluded(oldPath)) this.scheduleQuickSync();
+					if (isExcluded(file.path) && isExcluded(oldPath)) return;
+					this.markRecentlyModified(file.path);
+					this.scheduleQuickSync();
 				}),
 			);
 		});
@@ -473,6 +494,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let syncStateChanged = false;
 
 		for (const path of allPaths) {
+			// Still inside its settle window - leave it alone entirely this cycle (no push, pull,
+			// or conflict, not even backfilling syncState) so a file being actively typed into is
+			// never read mid-edit or overwritten by a pull decided before the edit happened. It's
+			// reconsidered on the next cycle once editing has paused.
+			if (this.isRecentlyModified(path)) continue;
+
 			const local = localShas.get(path);
 			const remote = remoteByPath.get(path);
 			const base = syncState[path];
@@ -785,7 +812,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			onProgress(`Pulling… batch ${i + 1}/${batches.length} (${done}/${changes.length} files done)`);
 			const batch = batches[i];
 			const outcomes = await Promise.allSettled(
-				batch.map(async (change) => {
+				batch.map(async (change): Promise<PlannedChange | null> => {
+					// The diff decided this before the fetch below started; re-check right before
+					// actually touching disk in case an edit landed on this exact path in between -
+					// skip it for now rather than overwrite content newer than the decision was.
+					if (this.isRecentlyModified(change.path)) return null;
 					if (change.action === "delete") {
 						await this.app.vault.adapter.remove(change.path);
 					} else {
@@ -793,6 +824,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 						if (!sha) throw new Error("Could not find the matching blob sha");
 						const bytes = await this.fetchBlobContent(sha);
 						await this.ensureParentFolder(change.path);
+						if (this.isRecentlyModified(change.path)) return null;
 						await this.app.vault.adapter.writeBinary(change.path, bytes);
 					}
 					return change;
@@ -802,8 +834,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			const succeeded: PlannedChange[] = [];
 			for (const outcome of outcomes) {
 				if (outcome.status === "fulfilled") {
-					succeeded.push(outcome.value);
-					done++;
+					if (outcome.value) {
+						succeeded.push(outcome.value);
+						done++;
+					}
 				} else {
 					failed++;
 					console.error("[multi-device-sync] pull failed", outcome.reason);
@@ -928,9 +962,18 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		this.openConflictModalLocked(conflicts);
 	}
 
-	// Debounce for create/delete/rename events: a burst of triggers in a short window collapses
-	// into one run after the last one.
-	private scheduleQuickSync(delayMs = 3000) {
+	private markRecentlyModified(path: string) {
+		this.recentlyModified.set(path, Date.now());
+	}
+
+	private isRecentlyModified(path: string): boolean {
+		const at = this.recentlyModified.get(path);
+		return at !== undefined && Date.now() - at < QUICK_SYNC_DEBOUNCE_MS;
+	}
+
+	// Debounce for create/modify/delete/rename events: a burst of triggers in a short window
+	// collapses into one run after the last one.
+	private scheduleQuickSync(delayMs = QUICK_SYNC_DEBOUNCE_MS) {
 		if (this.quickSyncDebounceTimer !== null) {
 			window.clearTimeout(this.quickSyncDebounceTimer);
 		}
@@ -1194,7 +1237,7 @@ class MultiDeviceSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Sync interval (minutes)")
 			.setDesc(
-				`${MIN_SYNC_INTERVAL_MINUTES}-${MAX_SYNC_INTERVAL_MINUTES} minutes, defaults to 10. A Quick Sync is also triggered separately on open and whenever a file is created, deleted, or renamed`,
+				`${MIN_SYNC_INTERVAL_MINUTES}-${MAX_SYNC_INTERVAL_MINUTES} minutes, defaults to 10. A Quick Sync is also triggered separately on open and whenever a file is created, edited, deleted, or renamed (edits wait a few seconds after you stop typing)`,
 			)
 			.addText((text) => {
 				text.inputEl.type = "number";
