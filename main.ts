@@ -553,17 +553,27 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			const remoteChanged = remote !== base;
 
 			if (localChanged && !remoteChanged) {
+				// Local is the source of truth here regardless of what remote looks like - always
+				// safe to push again, so this branch is never deferred by the recent-push guard
+				// below (that would only delay a legitimate follow-up edit for no reason).
 				toPush.push({ path, action: local === undefined ? "delete" : base === undefined ? "create" : "modify" });
-			} else if (remoteChanged && !localChanged) {
-				const action: ChangeAction = remote === undefined ? "delete" : base === undefined ? "create" : "modify";
-				// GitHub's tree hasn't caught up with a push this device itself just made for this
-				// exact path - leave it alone this cycle rather than undo our own recent push based
-				// on a stale read. Reconsidered next cycle once the guard window passes.
-				if (this.contradictsRecentPush(path, action)) {
-					console.log(`[github-rest-sync] GUARD: ignoring stale toPull:${action} contradicting our recent push - ${path}`);
-					continue;
-				}
-				toPull.push({ path, action });
+				continue;
+			}
+
+			// From here on, remote disagrees with what this device last recorded - either to pull
+			// (remote-only change) or as a conflict (both sides changed). GitHub's tree can briefly
+			// still reflect pre-push content on the very next fetch right after this device pushes
+			// something for this exact path, which can surface as either a contradicting toPull or
+			// a false conflict. Leave it alone entirely this cycle rather than act on a stale read;
+			// reconsidered once a later cycle confirms local and remote finally agree (see the
+			// local === remote branch above, which clears this guard).
+			if (this.wasRecentlyPushedByMe(path)) {
+				console.log(`[github-rest-sync] GUARD: deferring stale-looking result, we pushed this recently - ${path}`);
+				continue;
+			}
+
+			if (remoteChanged && !localChanged) {
+				toPull.push({ path, action: remote === undefined ? "delete" : base === undefined ? "create" : "modify" });
 			} else {
 				conflicts.push(path);
 			}
@@ -1053,12 +1063,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// True when a pull about to apply `incomingAction` to this path would flip its existence
 	// (create/modify vs delete) relative to what this device itself just pushed for it moments
 	// ago - the signature of the race described where recentlyPushedByMe is declared.
-	private contradictsRecentPush(path: string, incomingAction: ChangeAction): boolean {
+	// Broader than just an existence flip (create vs delete): a modify we just pushed can also
+	// come back as a stale conflict if GitHub's tree still reflects pre-push content on the very
+	// next fetch (observed directly - a normal edit to a real note, not a create/delete race,
+	// triggered a conflict dialog against content that was already superseded). Any path this
+	// device pushed recently is deferred wholesale - not diffed into toPull or conflicts at all -
+	// until a later cycle confirms local and remote finally agree.
+	private wasRecentlyPushedByMe(path: string): boolean {
 		const record = this.recentlyPushedByMe.get(path);
-		if (!record || Date.now() - record.at >= RECENT_PUSH_GUARD_MS) return false;
-		const pushedExists = record.action !== "delete";
-		const incomingExists = incomingAction !== "delete";
-		return pushedExists !== incomingExists;
+		return !!record && Date.now() - record.at < RECENT_PUSH_GUARD_MS;
 	}
 
 	// Debounce for create/modify/delete/rename events: a burst of triggers in a short window
