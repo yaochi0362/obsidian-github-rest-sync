@@ -310,7 +310,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			);
 			this.registerEvent(
 				this.app.vault.on("delete", (file) => {
-					if (!isExcluded(file.path)) this.scheduleQuickSync();
+					if (isExcluded(file.path)) return;
+					// A delete deserves the same settle window as create/modify/rename: a file
+					// created and deleted again within a few seconds (an abandoned "Untitled" note,
+					// a quick undo-then-redo) should settle as one unit instead of the create and
+					// delete landing in two separate sync cycles - which is how a since-deleted file
+					// could still end up diffed as a real conflict against GitHub.
+					this.markRecentlyModified(file.path);
+					this.scheduleQuickSync();
 				}),
 			);
 			this.registerEvent(
@@ -996,8 +1003,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	}
 
 	// Resolve a single file's conflict: pick a side, and overwrite the other side with that content.
+	// "Conflict" here can mean either side changed the content, OR one side deleted the file while
+	// the other changed it - keep-local on a path that's since been deleted locally means "push
+	// that deletion", not "read content that isn't there".
 	async resolveConflict(path: string, keep: "local" | "remote") {
 		if (keep === "local") {
+			if (!(await this.app.vault.adapter.exists(path))) {
+				await this.applyPush([{ path, action: "delete" }], new Map());
+				return;
+			}
 			const bytes = await this.app.vault.adapter.readBinary(path);
 			const sha = await gitBlobSha1(bytes);
 			await this.applyPush([{ path, action: "modify" }], new Map([[path, sha]]));
@@ -1010,6 +1024,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	}
 
 	async readLocalPreview(path: string): Promise<string> {
+		if (!(await this.app.vault.adapter.exists(path))) {
+			return "(This file has since been deleted locally)";
+		}
 		try {
 			const bytes = await this.app.vault.adapter.readBinary(path);
 			const text = this.decodeAsUtf8IfPossible(bytes);
