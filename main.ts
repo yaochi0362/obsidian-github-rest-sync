@@ -101,6 +101,12 @@ const MAX_SYNC_INTERVAL_MINUTES = 1440;
 // recentlyModified above).
 const QUICK_SYNC_DEBOUNCE_MS = 3000;
 
+// How long this device distrusts a pull decision that contradicts what it just pushed for the
+// same path (existence flipped either direction) - long enough to cover a couple of back-to-back
+// cycles while GitHub's tree catches up, short enough that a deliberate later change to the same
+// path isn't blocked for long.
+const RECENT_PUSH_GUARD_MS = 15000;
+
 interface ParsedRepo {
 	owner: string;
 	repo: string;
@@ -211,6 +217,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// window matches the debounce delay below so a debounced sync's own trigger file has just
 	// cleared it by the time the sync actually runs.
 	private recentlyModified = new Map<string, number>();
+	// path -> what this device last successfully pushed for it, and when. GitHub's tree API can
+	// briefly still reflect the pre-push state on the very next fetch (observed directly via
+	// console logging: a push's delete followed a few seconds later by that same path showing up
+	// as toPull:create, recreating it locally - and the same happens in reverse with rapid
+	// consecutive creates, where a just-created file gets read back as toPull:delete). Guards
+	// against a device undoing its own push against a remote view that hasn't caught up yet -
+	// purely local/in-memory, not shared across devices, since the race is this device's own
+	// back-to-back cycles racing GitHub's propagation.
+	private recentlyPushedByMe = new Map<string, { action: ChangeAction; at: number }>();
 
 	// Single entry point: blocks overlapping runs (e.g. tapping the button again mid-batch-push
 	// would have both runs fast-forwarding the branch and stepping on each other), and keeps one
@@ -533,7 +548,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			if (localChanged && !remoteChanged) {
 				toPush.push({ path, action: local === undefined ? "delete" : base === undefined ? "create" : "modify" });
 			} else if (remoteChanged && !localChanged) {
-				toPull.push({ path, action: remote === undefined ? "delete" : base === undefined ? "create" : "modify" });
+				const action: ChangeAction = remote === undefined ? "delete" : base === undefined ? "create" : "modify";
+				// GitHub's tree hasn't caught up with a push this device itself just made for this
+				// exact path - leave it alone this cycle rather than undo our own recent push based
+				// on a stale read. Reconsidered next cycle once the guard window passes.
+				if (this.contradictsRecentPush(path, action)) {
+					console.log(`[github-rest-sync] GUARD: ignoring stale toPull:${action} contradicting our recent push - ${path}`);
+					continue;
+				}
+				toPull.push({ path, action });
 			} else {
 				conflicts.push(path);
 			}
@@ -828,6 +851,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			// settling, or vanished before it could be read) is left out of syncState so the next
 			// diff reconsiders it fresh instead of wrongly treating it as up to date.
 			await this.recordSynced(result.applied, (path) => localShas.get(path));
+			for (const change of result.applied) this.markRecentlyPushed(change.path, change.action);
 			done += result.applied.length;
 		}
 		return done;
@@ -1013,6 +1037,21 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private isRecentlyModified(path: string): boolean {
 		const at = this.recentlyModified.get(path);
 		return at !== undefined && Date.now() - at < QUICK_SYNC_DEBOUNCE_MS;
+	}
+
+	private markRecentlyPushed(path: string, action: ChangeAction) {
+		this.recentlyPushedByMe.set(path, { action, at: Date.now() });
+	}
+
+	// True when a pull about to apply `incomingAction` to this path would flip its existence
+	// (create/modify vs delete) relative to what this device itself just pushed for it moments
+	// ago - the signature of the race described where recentlyPushedByMe is declared.
+	private contradictsRecentPush(path: string, incomingAction: ChangeAction): boolean {
+		const record = this.recentlyPushedByMe.get(path);
+		if (!record || Date.now() - record.at >= RECENT_PUSH_GUARD_MS) return false;
+		const pushedExists = record.action !== "delete";
+		const incomingExists = incomingAction !== "delete";
+		return pushedExists !== incomingExists;
 	}
 
 	// Debounce for create/modify/delete/rename events: a burst of triggers in a short window
