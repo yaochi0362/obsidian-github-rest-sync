@@ -101,11 +101,13 @@ const MAX_SYNC_INTERVAL_MINUTES = 1440;
 // recentlyModified above).
 const QUICK_SYNC_DEBOUNCE_MS = 3000;
 
-// How long this device distrusts a pull decision that contradicts what it just pushed for the
-// same path (existence flipped either direction) - long enough to cover a couple of back-to-back
-// cycles while GitHub's tree catches up, short enough that a deliberate later change to the same
-// path isn't blocked for long.
-const RECENT_PUSH_GUARD_MS = 15000;
+// Safety-valve ceiling only - the guard normally clears itself the moment a diff observes local
+// and remote finally agree (see the local === remote branch below), however long that actually
+// takes. This just bounds the worst case (a push that silently never landed) so a stuck guard
+// can't block a legitimate later change forever. Measured directly via console logging: real
+// propagation lag under rapid successive syncs ranged from a few seconds up to over a minute, far
+// too variable for a short fixed timeout to both catch reliably and not overstay its welcome.
+const RECENT_PUSH_GUARD_MS = 120000;
 
 interface ParsedRepo {
 	owner: string;
@@ -527,6 +529,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			const base = syncState[path];
 
 			if (local === remote) {
+				// Both sides agree now, whatever that state is - GitHub has caught up with
+				// whatever this device last pushed for this path (or the situation moved past it
+				// some other way), so the push guard below has done its job. Clear it immediately
+				// rather than waiting out its time-based ceiling.
+				this.recentlyPushedByMe.delete(path);
 				if (local === undefined) {
 					if (path in syncState) {
 						delete syncState[path];
