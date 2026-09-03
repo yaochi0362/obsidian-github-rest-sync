@@ -101,14 +101,6 @@ const MAX_SYNC_INTERVAL_MINUTES = 1440;
 // recentlyModified above).
 const QUICK_SYNC_DEBOUNCE_MS = 3000;
 
-// Deletion tombstones: without these, a resurrected file (Obsidian's own undo, clicking a stale
-// wikilink that auto-creates the target note) that shows up after this device's syncState has
-// already forgotten the deletion looks exactly like a genuinely new local file to the diff, and
-// gets pushed straight back up. Sharded by day - like a log - rather than one ever-growing file,
-// since a sync that touches deletions rewrites only the one day-file it needs.
-const TOMBSTONE_DIR = ".github-rest-sync-tombstones";
-const TOMBSTONE_RETENTION_DAYS = 10;
-
 interface ParsedRepo {
 	owner: string;
 	repo: string;
@@ -301,7 +293,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		// flood of new files and fire sync repeatedly.
 		this.app.workspace.onLayoutReady(() => {
 			this.quickSync(); // Sync once on open
-			this.pruneOldTombstones(); // Best-effort background cleanup, doesn't block the sync above
 
 			this.registerEvent(
 				this.app.vault.on("create", (file) => {
@@ -498,7 +489,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// one side can be safely auto-applied to the other; only when both sides changed, and
 	// differently, is it a real conflict. Also backfills syncState for any path that's now
 	// consistent on both sides (self-healing, regardless of whether it was already tracked).
-	private diff(remoteTree: GitTreeEntry[], localShas: Map<string, string>, tombstones: Map<string, number>): DiffResult {
+	private diff(remoteTree: GitTreeEntry[], localShas: Map<string, string>): DiffResult {
 		const remoteByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
 		const syncState = this.settings.syncState;
 		const allPaths = new Set<string>([...localShas.keys(), ...remoteByPath.keys(), ...Object.keys(syncState)]);
@@ -540,16 +531,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			const remoteChanged = remote !== base;
 
 			if (localChanged && !remoteChanged) {
-				const action: ChangeAction = local === undefined ? "delete" : base === undefined ? "create" : "modify";
-				if (action === "create" && tombstones.has(path)) {
-					// This device has no history for this path, but someone (often this very
-					// device, moments ago via Obsidian's own undo or an auto-created wikilink
-					// target) deliberately deleted it before. Treat it as a resurrection, not a
-					// genuinely new file, and delete it locally instead of pushing it back up.
-					toPull.push({ path, action: "delete" });
-				} else {
-					toPush.push({ path, action });
-				}
+				toPush.push({ path, action: local === undefined ? "delete" : base === undefined ? "create" : "modify" });
 			} else if (remoteChanged && !localChanged) {
 				toPull.push({ path, action: remote === undefined ? "delete" : base === undefined ? "create" : "modify" });
 			} else {
@@ -603,17 +585,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return true;
 	}
 
-	// tombstones is optional so ad-hoc callers don't need to fetch it themselves; runSyncCycle
-	// passes one in explicitly so its two calls per cycle share a single fetch.
-	private async computeDiffNow(
-		tombstones?: Map<string, number>,
-	): Promise<{ remoteTree: GitTreeEntry[]; localShas: Map<string, string>; result: DiffResult }> {
-		const [remoteTree, localShas, resolvedTombstones] = await Promise.all([
-			this.fetchRemoteTree(),
-			this.computeLocalShas(),
-			tombstones ?? this.fetchAllTombstones(),
-		]);
-		const result = this.diff(remoteTree, localShas, resolvedTombstones);
+	private async computeDiffNow(): Promise<{ remoteTree: GitTreeEntry[]; localShas: Map<string, string>; result: DiffResult }> {
+		const [remoteTree, localShas] = await Promise.all([this.fetchRemoteTree(), this.computeLocalShas()]);
+		const result = this.diff(remoteTree, localShas);
 		return { remoteTree, localShas, result };
 	}
 
@@ -633,113 +607,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private async writeReport(result: DiffResult) {
 		const report = this.buildReportMarkdown(result);
 		await this.app.vault.adapter.write(REPORT_FILE_PATH, report);
-	}
-
-	private tombstoneDateKey(date: Date): string {
-		const y = date.getUTCFullYear();
-		const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-		const d = String(date.getUTCDate()).padStart(2, "0");
-		return `${y}-${m}-${d}`;
-	}
-
-	private tombstonePath(dateKey: string): string {
-		return `${TOMBSTONE_DIR}/${dateKey}.json`;
-	}
-
-	// GET a JSON file straight from GitHub (not through the normal diff/pull path, since
-	// tombstone files are deliberately excluded from that - see isExcluded). Returns null for
-	// "doesn't exist yet", which is the common case (most days have no deletions).
-	private async fetchTombstoneFile(path: string): Promise<Record<string, number> | null> {
-		const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-		const res = await this.githubJson<{ content: string }>(
-			`${this.repoApiBase()}/contents/${encodedPath}?ref=${encodeURIComponent(this.settings.branch)}`,
-			"GET",
-		);
-		if (res.status === 404) return null;
-		if (res.status !== 200) throw new Error(`GitHub API error (${res.status}): ${res.text}`);
-		try {
-			return JSON.parse(new TextDecoder().decode(base64ToArrayBuffer(res.json.content))) as Record<string, number>;
-		} catch {
-			return {};
-		}
-	}
-
-	// Lists which day-files currently exist on GitHub, tolerating the directory not existing yet
-	// (a repo with no recorded deletions at all).
-	private async listTombstoneFiles(): Promise<string[]> {
-		const res = await this.githubJson<{ name: string; type: string }[]>(
-			`${this.repoApiBase()}/contents/${TOMBSTONE_DIR}?ref=${encodeURIComponent(this.settings.branch)}`,
-			"GET",
-		);
-		if (res.status === 404) return [];
-		if (res.status !== 200) throw new Error(`GitHub API error (${res.status}): ${res.text}`);
-		return res.json.filter((entry) => entry.type === "file" && entry.name.endsWith(".json")).map((entry) => `${TOMBSTONE_DIR}/${entry.name}`);
-	}
-
-	// Merges every currently-retained day-file into one path -> deleted-at map, consulted by
-	// diff() to tell a resurrected file apart from a genuinely new one.
-	private async fetchAllTombstones(): Promise<Map<string, number>> {
-		const merged = new Map<string, number>();
-		let files: string[];
-		try {
-			files = await this.listTombstoneFiles();
-		} catch (error) {
-			console.error("[github-rest-sync] failed to list tombstone files", error);
-			return merged;
-		}
-		const contents = await Promise.all(files.map((path) => this.fetchTombstoneFile(path).catch(() => null)));
-		for (const content of contents) {
-			if (!content) continue;
-			for (const [path, deletedAt] of Object.entries(content)) merged.set(path, deletedAt);
-		}
-		return merged;
-	}
-
-	// Appends this cycle's deletions to today's day-file (read-merge-write against whatever's
-	// currently on GitHub) and writes the merged result to local disk so it flows through the
-	// normal push batch as an ordinary change - keeping the tombstone update in the very same
-	// commit as the deletes it records, rather than a separate step that could fail independently.
-	private async recordTombstonesForDeletes(paths: string[]): Promise<PlannedChange | null> {
-		if (paths.length === 0) return null;
-		const path = this.tombstonePath(this.tombstoneDateKey(new Date()));
-		let current: Record<string, number>;
-		try {
-			current = (await this.fetchTombstoneFile(path)) ?? {};
-		} catch (error) {
-			console.error("[github-rest-sync] failed to read today's tombstone file, starting fresh", error);
-			current = {};
-		}
-		const now = Date.now();
-		for (const p of paths) current[p] = now;
-		await this.ensureParentFolder(path);
-		await this.app.vault.adapter.write(path, JSON.stringify(current));
-		return { path, action: "modify" };
-	}
-
-	// Called once on app open: deletes day-files older than the retention window, both locally
-	// and on GitHub, so this log doesn't grow forever. Best-effort - a failure here just means
-	// pruning is retried on the next open, not a sync failure.
-	private async pruneOldTombstones() {
-		try {
-			const files = await this.listTombstoneFiles();
-			const cutoff = Date.now() - TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-			const stale = files.filter((path) => {
-				const dateKey = path.slice(TOMBSTONE_DIR.length + 1, -".json".length);
-				const parsedDate = Date.parse(`${dateKey}T00:00:00Z`);
-				return !Number.isNaN(parsedDate) && parsedDate < cutoff;
-			});
-			if (stale.length === 0) return;
-			for (const path of stale) {
-				if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path);
-			}
-			const head = await this.getBranchHead();
-			await this.commitBatch(
-				stale.map((path) => ({ path, action: "delete" as const })),
-				head,
-			);
-		} catch (error) {
-			console.error("[github-rest-sync] failed to prune old tombstones", error);
-		}
 	}
 
 	private async fetchBlobContent(sha: string): Promise<ArrayBuffer> {
@@ -1026,18 +893,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		onProgress: (msg: string) => void = () => {},
 	): Promise<{ pushed: number; pulled: number; pullFailed: number; conflicts: string[]; skippedPush: number }> {
 		onProgress("Comparing…");
-		const tombstones = await this.fetchAllTombstones();
-		const { remoteTree, localShas, result } = await this.computeDiffNow(tombstones);
+		const { remoteTree, localShas, result } = await this.computeDiffNow();
 
 		const isFirstSync = !this.settings.firstSyncDone;
-		if (!isFirstSync) {
-			// Record today's deletions before pushing, so the tombstone update rides in the same
-			// batch/commit as the deletes it's recording - not a separate step that could fail on
-			// its own and leave a delete unrecorded.
-			const deletedPaths = result.toPush.filter((change) => change.action === "delete").map((change) => change.path);
-			const tombstoneChange = await this.recordTombstonesForDeletes(deletedPaths);
-			if (tombstoneChange) result.toPush.push(tombstoneChange);
-		}
 		const pushed = isFirstSync ? 0 : await this.applyPush(result.toPush, localShas, onProgress);
 		const skippedPush = isFirstSync ? result.toPush.length : 0;
 
@@ -1050,7 +908,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 
 		onProgress("Updating diff report…");
-		const { result: finalResult } = await this.computeDiffNow(tombstones);
+		const { result: finalResult } = await this.computeDiffNow();
 		await this.writeReport(finalResult);
 
 		return { pushed, pulled, pullFailed, conflicts: finalResult.conflicts, skippedPush };
