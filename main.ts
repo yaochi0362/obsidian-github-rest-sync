@@ -675,12 +675,20 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// you); only binary files (images, PDFs, etc.) need a separate call to the blobs API first
 	// to get a sha. A delete is represented as sha: null - that's how the GitHub tree API says
 	// "remove this path from what was inherited via base_tree".
+	// Returns null to mean "skip this change for now" - either it's still inside its settle
+	// window, or (a rapid create-then-delete during the same cycle) the file has already vanished
+	// by the time we got here. Skipping it here, rather than letting readBinary's ENOENT abort the
+	// whole batch, means the rest of the batch's genuinely-ready changes still go through; the
+	// skipped one is simply reconsidered - as whatever it currently is - on the next cycle.
 	private async buildTreeEntry(
 		change: PlannedChange,
-	): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string | null }> {
+	): Promise<{ path: string; mode: "100644"; type: "blob"; content?: string; sha?: string | null } | null> {
 		if (change.action === "delete") {
 			return { path: change.path, mode: "100644", type: "blob", sha: null };
 		}
+
+		if (this.isRecentlyModified(change.path)) return null;
+		if (!(await this.app.vault.adapter.exists(change.path))) return null;
 
 		const bytes = await this.app.vault.adapter.readBinary(change.path);
 		const text = this.decodeAsUtf8IfPossible(bytes);
@@ -703,10 +711,20 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		changes: PlannedChange[],
 		base: { commitSha: string; treeSha: string } | null,
 		retriesLeft = 4,
-	): Promise<{ commitSha: string; treeSha: string }> {
+	): Promise<{ head: { commitSha: string; treeSha: string } | null; applied: PlannedChange[] }> {
 		const entries = [];
+		const applied: PlannedChange[] = [];
 		for (const change of changes) {
-			entries.push(await this.buildTreeEntry(change));
+			const entry = await this.buildTreeEntry(change);
+			if (entry === null) continue;
+			entries.push(entry);
+			applied.push(change);
+		}
+
+		if (applied.length === 0) {
+			// Everything in this batch got skipped (still settling, or vanished before we read it) -
+			// nothing to commit, leave the branch untouched.
+			return { head: base, applied: [] };
 		}
 
 		const treeRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/trees`, "POST", {
@@ -743,7 +761,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const newTreeSha = treeRes.json.sha;
 
 		const commitRes = await this.githubJson<{ sha: string }>(`${this.repoApiBase()}/git/commits`, "POST", {
-			message: `GitHub REST Sync: sync ${changes.length} files`,
+			message: `GitHub REST Sync: sync ${applied.length} files`,
 			tree: newTreeSha,
 			...(base ? { parents: [base.commitSha] } : {}),
 		});
@@ -757,7 +775,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const refRes = await this.githubJson(refUrl, base ? "PATCH" : "POST", refBody);
 
 		if (refRes.status === 200 || refRes.status === 201) {
-			return { commitSha: newCommitSha, treeSha: newTreeSha };
+			return { head: { commitSha: newCommitSha, treeSha: newTreeSha }, applied };
 		}
 
 		// 422 (not a fast forward) / 409: the branch was moved by something else after we read
@@ -793,9 +811,13 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		let done = 0;
 		for (let i = 0; i < batches.length; i++) {
 			onProgress(`Pushing… commit ${i + 1}/${batches.length} (${done}/${changes.length} files done)`);
-			head = await this.commitBatch(batches[i], head);
-			await this.recordSynced(batches[i], (path) => localShas.get(path));
-			done += batches[i].length;
+			const result = await this.commitBatch(batches[i], head);
+			head = result.head;
+			// Only the changes actually committed get recorded as synced - anything skipped (still
+			// settling, or vanished before it could be read) is left out of syncState so the next
+			// diff reconsiders it fresh instead of wrongly treating it as up to date.
+			await this.recordSynced(result.applied, (path) => localShas.get(path));
+			done += result.applied.length;
 		}
 		return done;
 	}
