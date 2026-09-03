@@ -547,6 +547,17 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		toPush.sort((a, b) => a.path.localeCompare(b.path));
 		toPull.sort((a, b) => a.path.localeCompare(b.path));
 		conflicts.sort();
+		if (toPush.length > 0 || toPull.length > 0 || conflicts.length > 0) {
+			console.log(
+				"[github-rest-sync] diff:",
+				"toPush=",
+				toPush.map((c) => `${c.action}:${c.path}`),
+				"toPull=",
+				toPull.map((c) => `${c.action}:${c.path}`),
+				"conflicts=",
+				conflicts,
+			);
+		}
 		return { toPush, toPull, conflicts, inSyncCount };
 	}
 
@@ -847,6 +858,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					// skip it for now rather than overwrite content newer than the decision was.
 					if (this.isRecentlyModified(change.path)) return null;
 					if (change.action === "delete") {
+						console.log(`[github-rest-sync] PULL: removing local file (GitHub deleted it) - ${change.path}`);
 						await this.app.vault.adapter.remove(change.path);
 					} else {
 						const sha = shaByPath.get(change.path);
@@ -854,6 +866,9 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 						const bytes = await this.fetchBlobContent(sha);
 						await this.ensureParentFolder(change.path);
 						if (this.isRecentlyModified(change.path)) return null;
+						console.log(
+							`[github-rest-sync] PULL: writing local file from GitHub content (${change.action}) - ${change.path}`,
+						);
 						await this.app.vault.adapter.writeBinary(change.path, bytes);
 					}
 					return change;
