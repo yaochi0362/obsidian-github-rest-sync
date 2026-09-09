@@ -447,6 +447,13 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return {
 			Authorization: `Bearer ${this.settings.token}`,
 			Accept: "application/vnd.github+json",
+			// Some mobile network stacks cache GET responses more aggressively than desktop,
+			// regardless of GitHub's own cache headers - forcing a fresh read matters here more
+			// than almost anywhere else in the plugin, since every diff's correctness depends on
+			// this actually reflecting GitHub's current state, not a stale snapshot from before a
+			// deletion elsewhere.
+			"Cache-Control": "no-cache, no-store",
+			Pragma: "no-cache",
 		};
 	}
 
@@ -455,7 +462,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		if (!parsed) throw new Error("Could not parse the repository URL");
 		const { owner, repo } = parsed;
 		const { branch } = this.settings;
-		const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+		// _=<timestamp> is a plain cache-busting param, not a GitHub API parameter - some caching
+		// layers key purely on URL and ignore Cache-Control/Pragma entirely, so a same-URL GET can
+		// still come back stale on top of the no-cache headers in githubHeaders().
+		const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1&_=${Date.now()}`;
 		const res = await requestUrl({ url, headers: this.githubHeaders(), throw: false });
 		if (res.status === 409) {
 			// GitHub returns 409 "Git Repository is empty." for a brand-new repo with no commits
