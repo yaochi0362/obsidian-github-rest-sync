@@ -20,6 +20,7 @@ This plugin deliberately **avoids the git protocol entirely**. It calls GitHub's
 - **Never touches a file mid-edit**: any path modified in the last few seconds is skipped entirely for that sync cycle - not diffed, not pushed, not overwritten by a pull - and picked up again once it settles, so a sync can't catch content half-typed or overwrite it with an older version decided on before the edit happened
 - **Pull-only first sync**: a device's very first sync only pulls from GitHub and never pushes. A fresh install has no record of what was previously synced, so it can't tell a genuinely new local file apart from a stale one this device happens to still have (e.g. re-installing on an old machine that never got a folder reorg another device already pushed). Local-only files found on the first sync are reported but not uploaded - review them, then sync again to push normally
 - **Batched sync**: pushes are packed into a handful of commits via the git tree/commit API (not one commit per file), and pulls run in parallel batches - stays reliable even with a large number of files
+- **No leftover empty folders**: deleting a file doesn't remove its now-empty parent folder on its own - neither Obsidian's nor this plugin's delete does that by default - so this walks upward and removes each folder level that's now empty, whether the delete came from Obsidian itself or from a pull
 - **Automation**:
   - Syncs once automatically when the app opens
   - Periodic sync (defaults to every 10 minutes, adjustable to 1-1440 minutes in settings)

@@ -341,6 +341,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					// could still end up diffed as a real conflict against GitHub.
 					this.markRecentlyModified(file.path);
 					this.scheduleQuickSync();
+					// Obsidian's own delete doesn't clean up a now-empty parent folder on its own -
+					// that's how an empty folder shell has repeatedly lingered in the file browser
+					// confusingly after every file inside it was deleted.
+					void this.pruneEmptyFoldersUpward(file.path);
 				}),
 			);
 			this.registerEvent(
@@ -732,6 +736,28 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// Deleting a file doesn't remove its now-possibly-empty parent folder on its own - neither
+	// Obsidian's own delete nor this plugin's pull-delete does that by default, which is how a
+	// deleted folder's empty shell (all its files gone, the folder itself still visible) has
+	// repeatedly shown up confusingly in the file browser across devices. Walk upward from the
+	// deleted file's folder, removing each level that's now empty, stopping at the first
+	// non-empty folder, the vault root, or an excluded path (.obsidian/, .git/, etc.).
+	private async pruneEmptyFoldersUpward(filePath: string): Promise<void> {
+		let dir = filePath.split("/").slice(0, -1).join("/");
+		while (dir && !isExcluded(`${dir}/`)) {
+			let listing: { files: string[]; folders: string[] };
+			try {
+				listing = await this.app.vault.adapter.list(dir);
+			} catch {
+				// Already gone (e.g. a concurrent delete/prune got there first) - nothing left to do.
+				break;
+			}
+			if (listing.files.length > 0 || listing.folders.length > 0) break;
+			await this.app.vault.adapter.rmdir(dir, false);
+			dir = dir.split("/").slice(0, -1).join("/");
+		}
+	}
+
 	private repoApiBase(): string {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
 		if (!parsed) throw new Error("Could not parse the repository URL");
@@ -953,6 +979,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					if (change.action === "delete") {
 						console.log(`[github-rest-sync] PULL: removing local file (GitHub deleted it) - ${change.path}`);
 						await this.app.vault.adapter.remove(change.path);
+						await this.pruneEmptyFoldersUpward(change.path);
 					} else {
 						const sha = shaByPath.get(change.path);
 						if (!sha) throw new Error("Could not find the matching blob sha");
