@@ -712,14 +712,33 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// Returns true if `dir` itself ended up empty and was removed, so the caller (its parent) knows.
 	private async pruneAllEmptyFolders(dir = ""): Promise<boolean> {
 		if (dir !== "" && isExcluded(`${dir}/`)) return false;
-		const { files, folders } = await this.app.vault.adapter.list(dir);
+		let files: string[];
+		let folders: string[];
+		try {
+			({ files, folders } = await this.app.vault.adapter.list(dir));
+		} catch (error) {
+			// Can't read it (permissions, or it vanished between listing and now) - leave it alone
+			// rather than letting one unreadable folder abort the whole vault-wide sweep.
+			console.error("[github-rest-sync] failed to list folder while pruning", dir, error);
+			return false;
+		}
 		let allSubfoldersRemoved = true;
 		for (const folder of folders) {
 			const removed = await this.pruneAllEmptyFolders(folder);
 			if (!removed) allSubfoldersRemoved = false;
 		}
-		if (dir === "" || files.length > 0 || !allSubfoldersRemoved) return false;
-		await this.app.vault.adapter.rmdir(dir, false);
+		// A stray junk file (.DS_Store and the like) doesn't count as real content - it already
+		// wouldn't be synced, so a folder containing only that is still "empty" for this purpose.
+		const realFiles = files.filter((file) => !isExcluded(file));
+		if (dir === "" || realFiles.length > 0 || !allSubfoldersRemoved) return false;
+		try {
+			// recursive: true also clears out any such junk files, which a plain (non-recursive)
+			// rmdir would otherwise refuse to remove.
+			await this.app.vault.adapter.rmdir(dir, true);
+		} catch (error) {
+			console.error("[github-rest-sync] failed to remove empty folder", dir, error);
+			return false;
+		}
 		return true;
 	}
 
@@ -782,7 +801,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 
 		if (this.isRecentlyModified(change.path)) return null;
-		if (!(await this.app.vault.adapter.exists(change.path))) return null;
+		const stat = await this.app.vault.adapter.stat(change.path).catch(() => null);
+		// exists() alone can't tell a file apart from a folder of the same path (e.g. a note
+		// reorganized into a same-named folder) - readBinary() on a folder throws EISDIR and would
+		// crash the whole batch the same way applyPull's delete once did. Skip it like a vanished
+		// file; it's reconsidered fresh on the next cycle.
+		if (!stat || stat.type === "folder") return null;
 
 		const bytes = await this.app.vault.adapter.readBinary(change.path);
 		const text = this.decodeAsUtf8IfPossible(bytes);
