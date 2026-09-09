@@ -942,7 +942,16 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					// skip it for now rather than overwrite content newer than the decision was.
 					if (this.isRecentlyModified(change.path)) return null;
 					if (change.action === "delete") {
-						await this.app.vault.adapter.remove(change.path);
+						// The diff only knows a path as a string, and if it was ever a file that's
+						// since been replaced by a folder of the same name, adapter.remove() (files
+						// only) throws EISDIR - check first and use rmdir for that case instead of
+						// crashing the whole sync.
+						const stat = await this.app.vault.adapter.stat(change.path).catch(() => null);
+						if (stat?.type === "folder") {
+							await this.app.vault.adapter.rmdir(change.path, true);
+						} else {
+							await this.app.vault.adapter.remove(change.path);
+						}
 						await this.pruneEmptyFoldersUpward(change.path);
 					} else {
 						const sha = shaByPath.get(change.path);
