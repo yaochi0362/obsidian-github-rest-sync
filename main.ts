@@ -704,6 +704,25 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// pruneEmptyFoldersUpward only fires reactively, off a delete this device just made - it can't
+	// retroactively clean up a folder that was already empty before that code existed (e.g. from
+	// deletes another device made, or from before this feature shipped at all). This walks the
+	// whole vault proactively instead, bottom-up, removing every folder left with nothing in it
+	// (recursing first so a folder that only contains other now-empty folders gets removed too).
+	// Returns true if `dir` itself ended up empty and was removed, so the caller (its parent) knows.
+	private async pruneAllEmptyFolders(dir = ""): Promise<boolean> {
+		if (dir !== "" && isExcluded(`${dir}/`)) return false;
+		const { files, folders } = await this.app.vault.adapter.list(dir);
+		let allSubfoldersRemoved = true;
+		for (const folder of folders) {
+			const removed = await this.pruneAllEmptyFolders(folder);
+			if (!removed) allSubfoldersRemoved = false;
+		}
+		if (dir === "" || files.length > 0 || !allSubfoldersRemoved) return false;
+		await this.app.vault.adapter.rmdir(dir, false);
+		return true;
+	}
+
 	private repoApiBase(): string {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
 		if (!parsed) throw new Error("Could not parse the repository URL");
@@ -970,6 +989,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		onProgress: (msg: string) => void = () => {},
 	): Promise<{ pushed: number; pulled: number; pullFailed: number; conflicts: string[]; skippedPush: number }> {
 		onProgress("Comparing…");
+		await this.pruneAllEmptyFolders();
 		const { remoteTree, localShas, result } = await this.computeDiffNow();
 
 		const isFirstSync = !this.settings.firstSyncDone;
