@@ -229,12 +229,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// back-to-back cycles racing GitHub's propagation.
 	private recentlyPushedByMe = new Map<string, { action: ChangeAction; at: number }>();
 
-	// Set by the most recent fetchRemoteTree() call, read by the report's diagnostic section -
-	// lets a report explain a "0 changes" result that doesn't match what's visibly still on disk
-	// without needing separate console access (not readily available on mobile).
-	private lastFetchTruncated = false;
-	private lastFetchRawCount = 0;
-
 	// Single entry point: blocks overlapping runs (e.g. tapping the button again mid-batch-push
 	// would have both runs fast-forwarding the branch and stepping on each other), and keeps one
 	// progress modal open for the whole operation, updating its text instead of firing a stream
@@ -487,8 +481,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			throw new Error(`GitHub API error (${res.status}): ${res.text}`);
 		}
 		const data = res.json as { tree: GitTreeEntry[]; truncated: boolean };
-		this.lastFetchTruncated = data.truncated;
-		this.lastFetchRawCount = data.tree.length;
 		if (data.truncated) {
 			new Notice("⚠️ This repo has too many files - GitHub truncated the file list, so the diff may be incomplete");
 		}
@@ -590,7 +582,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			// reconsidered once a later cycle confirms local and remote finally agree (see the
 			// local === remote branch above, which clears this guard).
 			if (this.wasRecentlyPushedByMe(path)) {
-				console.log(`[github-rest-sync] GUARD: deferring stale-looking result, we pushed this recently - ${path}`);
 				continue;
 			}
 
@@ -609,53 +600,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		toPush.sort((a, b) => a.path.localeCompare(b.path));
 		toPull.sort((a, b) => a.path.localeCompare(b.path));
 		conflicts.sort();
-		if (toPush.length > 0 || toPull.length > 0 || conflicts.length > 0) {
-			console.log(
-				"[github-rest-sync] diff:",
-				"toPush=",
-				toPush.map((c) => `${c.action}:${c.path}`),
-				"toPull=",
-				toPull.map((c) => `${c.action}:${c.path}`),
-				"conflicts=",
-				conflicts,
-			);
-		}
 		return { toPush, toPull, conflicts, inSyncCount };
 	}
 
-	// Prefixes that are known to have been reorganized away or deleted elsewhere - if a device
-	// still shows matching content here, that's a red flag its remote-tree view is stale or wrong,
-	// worth surfacing directly in the report since mobile has no easy console access.
-	private static readonly DIAGNOSTIC_PREFIXES = ["MindMap/", "AINote/", "AINotes/"];
-
-	private buildDiagnosticSection(remoteTree: GitTreeEntry[], localShas: Map<string, string>): string {
-		const remoteByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
-		const short = (sha: string | undefined) => (sha ? sha.slice(0, 8) : "(none)");
-		const isSuspicious = (path: string) =>
-			MultiDeviceSyncPlugin.DIAGNOSTIC_PREFIXES.some((prefix) => path.startsWith(prefix)) &&
-			!path.startsWith("MindMap/KnowledgeBase/");
-
-		const suspiciousPaths = [...localShas.keys()].filter(isSuspicious).sort();
-		const lines = [
-			`# Diagnostic info`,
-			``,
-			`Remote tree: ${this.lastFetchRawCount} raw entries fetched, truncated=${this.lastFetchTruncated}`,
-			`Local files scanned: ${localShas.size}`,
-			`Local paths under a reorganized-away prefix (${MultiDeviceSyncPlugin.DIAGNOSTIC_PREFIXES.join(", ")}, excluding MindMap/KnowledgeBase/): ${suspiciousPaths.length}`,
-		];
-		if (suspiciousPaths.length > 0) {
-			lines.push(``, `First ${Math.min(20, suspiciousPaths.length)} of them - local sha / remote sha / this device's recorded base:`);
-			for (const path of suspiciousPaths.slice(0, 20)) {
-				const local = short(localShas.get(path));
-				const remote = short(remoteByPath.get(path));
-				const base = short(this.settings.syncState[path]);
-				lines.push(`- \`${path}\` — local=${local} remote=${remote} base=${base}`);
-			}
-		}
-		return lines.join("\n") + "\n";
-	}
-
-	private buildReportMarkdown(result: DiffResult, remoteTree: GitTreeEntry[], localShas: Map<string, string>): string {
+	private buildReportMarkdown(result: DiffResult): string {
 		const actionLabel: Record<ChangeAction, string> = { create: "Added", modify: "Modified", delete: "Deleted" };
 		const changeSection = (title: string, items: PlannedChange[]) =>
 			items.length > 0
@@ -675,8 +623,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			changeSection("Changed locally only - will be pushed to GitHub", result.toPush),
 			changeSection("Changed on GitHub only - will be pulled locally", result.toPull),
 			pathSection("Changed on both sides, differently (needs manual review)", result.conflicts),
-			``,
-			this.buildDiagnosticSection(remoteTree, localShas),
 		].join("\n");
 	}
 
@@ -711,8 +657,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
-	private async writeReport(result: DiffResult, remoteTree: GitTreeEntry[], localShas: Map<string, string>) {
-		const report = this.buildReportMarkdown(result, remoteTree, localShas);
+	private async writeReport(result: DiffResult) {
+		const report = this.buildReportMarkdown(result);
 		await this.app.vault.adapter.write(REPORT_FILE_PATH, report);
 	}
 
@@ -977,7 +923,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					// skip it for now rather than overwrite content newer than the decision was.
 					if (this.isRecentlyModified(change.path)) return null;
 					if (change.action === "delete") {
-						console.log(`[github-rest-sync] PULL: removing local file (GitHub deleted it) - ${change.path}`);
 						await this.app.vault.adapter.remove(change.path);
 						await this.pruneEmptyFoldersUpward(change.path);
 					} else {
@@ -986,9 +931,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 						const bytes = await this.fetchBlobContent(sha);
 						await this.ensureParentFolder(change.path);
 						if (this.isRecentlyModified(change.path)) return null;
-						console.log(
-							`[github-rest-sync] PULL: writing local file from GitHub content (${change.action}) - ${change.path}`,
-						);
 						await this.app.vault.adapter.writeBinary(change.path, bytes);
 					}
 					return change;
@@ -1043,8 +985,8 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 
 		onProgress("Updating diff report…");
-		const { remoteTree: finalRemoteTree, localShas: finalLocalShas, result: finalResult } = await this.computeDiffNow();
-		await this.writeReport(finalResult, finalRemoteTree, finalLocalShas);
+		const { result: finalResult } = await this.computeDiffNow();
+		await this.writeReport(finalResult);
 
 		return { pushed, pulled, pullFailed, conflicts: finalResult.conflicts, skippedPush };
 	}
