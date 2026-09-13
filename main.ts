@@ -802,7 +802,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			`${this.repoApiBase()}/git/refs/heads/${encodeURIComponent(this.settings.branch)}`,
 			"GET",
 		);
-		if (refRes.status === 404) return null;
+		// 404: this branch's ref doesn't exist yet (repo has other commits, just not on this
+		// branch). 409 "Git Repository is empty": no commits anywhere yet, a genuinely brand-new
+		// repo - fetchRemoteTree() already tolerates this same response the same way; this needed
+		// the same handling and didn't have it, breaking the very first push to a fresh repo.
+		if (refRes.status === 404 || refRes.status === 409) return null;
 		if (refRes.status !== 200) throw new Error(`Failed to get branch info (${refRes.status}): ${refRes.text}`);
 		const commitSha = refRes.json.object.sha;
 
