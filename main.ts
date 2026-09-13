@@ -214,6 +214,17 @@ function retryJitterMs(): number {
 	return 300 + Math.floor(Math.random() * 500);
 }
 
+// GitHub's low-level Git Data API (blobs, trees) refuses to create ANY object at all on a
+// genuinely empty repository - confirmed directly against a real empty repo, even a bare blob
+// POST returns this same 409, though it works immediately once a single commit exists. Thrown
+// from buildTreeEntry's blob upload so commitBatch can catch it specifically (as opposed to any
+// other blob-creation failure) and bootstrap the repo instead of just failing the push.
+class EmptyRepoError extends Error {}
+
+function isEmptyRepoResponse(res: { status: number; text: string }): boolean {
+	return res.status === 409 && /repository is empty/i.test(res.text);
+}
+
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
 	const uint8 = new Uint8Array(bytes);
 	let binary = "";
@@ -815,6 +826,29 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		return { commitSha, treeSha: commitRes.json.tree.sha };
 	}
 
+	// The one GitHub endpoint that CAN create a repository's very first commit - confirmed
+	// directly against a real empty repo that the low-level Git Data API (blobs/trees) cannot, no
+	// matter what's passed. Uses one real file from the batch as that first commit's content;
+	// commitBatch's retry then rebuilds the whole batch normally (including this same file) now
+	// that a real base exists, so nothing about the file list needs to be tracked separately here.
+	private async bootstrapEmptyRepo(changes: PlannedChange[]): Promise<{ commitSha: string; treeSha: string }> {
+		const first = changes.find((change) => change.action !== "delete");
+		if (!first) throw new Error("Cannot initialize an empty repository with only deletions");
+		const bytes = await this.app.vault.adapter.readBinary(first.path);
+		const encodedPath = first.path.split("/").map(encodeURIComponent).join("/");
+		const res = await this.githubJson<{ commit: { sha: string; tree: { sha: string } } }>(
+			`${this.repoApiBase()}/contents/${encodedPath}`,
+			"PUT",
+			{
+				message: "GitHub REST Sync: initialize repository",
+				content: arrayBufferToBase64(bytes),
+				branch: this.settings.branch,
+			},
+		);
+		if (res.status !== 201) throw new Error(`Failed to initialize the empty repository (${res.status}): ${res.text}`);
+		return { commitSha: res.json.commit.sha, treeSha: res.json.commit.tree.sha };
+	}
+
 	private decodeAsUtf8IfPossible(bytes: ArrayBuffer): string | null {
 		try {
 			return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -856,7 +890,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			content: arrayBufferToBase64(bytes),
 			encoding: "base64",
 		});
-		if (blobRes.status !== 201) throw new Error(`Failed to create blob (${blobRes.status}): ${blobRes.text}`);
+		if (blobRes.status !== 201) {
+			if (isEmptyRepoResponse(blobRes)) throw new EmptyRepoError(blobRes.text);
+			throw new Error(`Failed to create blob (${blobRes.status}): ${blobRes.text}`);
+		}
 		return { path: change.path, mode: "100644", type: "blob", sha: blobRes.json.sha };
 	}
 
@@ -871,11 +908,19 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	): Promise<{ head: { commitSha: string; treeSha: string } | null; applied: PlannedChange[] }> {
 		const entries = [];
 		const applied: PlannedChange[] = [];
-		for (const change of changes) {
-			const entry = await this.buildTreeEntry(change);
-			if (entry === null) continue;
-			entries.push(entry);
-			applied.push(change);
+		try {
+			for (const change of changes) {
+				const entry = await this.buildTreeEntry(change);
+				if (entry === null) continue;
+				entries.push(entry);
+				applied.push(change);
+			}
+		} catch (error) {
+			if (error instanceof EmptyRepoError && !base && retriesLeft > 0) {
+				const freshBase = await this.bootstrapEmptyRepo(changes);
+				return this.commitBatch(changes, freshBase, retriesLeft - 1);
+			}
+			throw error;
 		}
 
 		if (applied.length === 0) {
@@ -889,6 +934,14 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 			...(base ? { base_tree: base.treeSha } : {}),
 		});
 		if (treeRes.status !== 201) {
+			// Confirmed directly against a real empty repo: even a tree with no base_tree at all
+			// gets this same 409 until a first commit exists. bootstrapEmptyRepo() creates that
+			// first commit via the one API that can, then this batch (including whatever file just
+			// bootstrapped it) is rebuilt normally against the now-real base.
+			if (isEmptyRepoResponse(treeRes) && !base && retriesLeft > 0) {
+				const freshBase = await this.bootstrapEmptyRepo(changes);
+				return this.commitBatch(changes, freshBase, retriesLeft - 1);
+			}
 			// 422 here is usually "GitRPC::BadObjectState" - base_tree went stale because the branch
 			// moved after we read it. Keep retrying on any 422 regardless of the exact message: a
 			// retry just refetches the head and rebuilds the batch, which is harmless even if the
