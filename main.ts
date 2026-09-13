@@ -164,9 +164,44 @@ interface DiffResult {
 // free, which is exactly how a git worktree checked out at .claude/worktrees/<name>/ (a real,
 // legitimate directory, just not vault content) ended up being diffed as ~1100 new files, including
 // a nested .git entry GitHub's tree API rejects outright as a malformed path component.
+//
+// One deliberate carve-out: community-plugins.json (which plugins are enabled) and each plugin's
+// own main.js/manifest.json/styles.css (the plugin code itself) - so a new device's plugins come
+// installed and enabled from a sync instead of reinstalling each one by hand. Each plugin's
+// data.json is NOT included, on purpose: Obsidian has no secure-storage API for plugins to use
+// instead, so a plugin that needs an API key or token (this one included) has nowhere to put it
+// except a plain-text data.json - syncing that wholesale would leak whatever's in it to the repo.
+// This is a filename-based allowlist, not a plugin-name one: it can't accidentally include a
+// future plugin's secrets just because that plugin wasn't known about yet.
+const PLUGIN_SYNC_ALLOWED_FILENAMES = new Set(["main.js", "manifest.json", "styles.css"]);
+const COMMUNITY_PLUGINS_LIST_PATH = ".obsidian/community-plugins.json";
+
+function isAllowedPluginSyncFile(path: string): boolean {
+	if (path === COMMUNITY_PLUGINS_LIST_PATH) return true;
+	const parts = path.split("/");
+	// .obsidian / plugins / <id> / <filename> - exactly four segments, nothing nested deeper.
+	return (
+		parts.length === 4 &&
+		parts[0] === ".obsidian" &&
+		parts[1] === "plugins" &&
+		PLUGIN_SYNC_ALLOWED_FILENAMES.has(parts[3])
+	);
+}
+
 function isExcluded(path: string): boolean {
 	if (EXCLUDED_PATHS.includes(path)) return true;
+	if (isAllowedPluginSyncFile(path)) return false;
 	return path.split("/").some((segment) => segment.startsWith("."));
+}
+
+// Whether the local-file walk should descend into this folder at all. Mirrors isExcluded's normal
+// dot-folder pruning, but .obsidian needs partial traversal - just far enough to reach the
+// allowlisted plugin files above, never into a plugin's own subfolders (main.js/manifest.json/
+// styles.css always sit directly in the plugin's root per Obsidian's own plugin layout).
+function shouldTraverseIntoFolder(folderPath: string): boolean {
+	if (!isExcluded(`${folderPath}/`)) return true;
+	if (folderPath === ".obsidian" || folderPath === ".obsidian/plugins") return true;
+	return /^\.obsidian\/plugins\/[^/]+$/.test(folderPath);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -498,7 +533,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const { files, folders } = await this.app.vault.adapter.list(dir);
 		const paths = [...files];
 		for (const folder of folders) {
-			if (isExcluded(`${folder}/`)) continue;
+			if (!shouldTraverseIntoFolder(folder)) continue;
 			paths.push(...(await this.listAllFilePaths(folder)));
 		}
 		return paths;
