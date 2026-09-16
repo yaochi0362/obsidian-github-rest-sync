@@ -414,6 +414,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				this.app.vault.on("rename", (file, oldPath) => {
 					if (isExcluded(file.path) && isExcluded(oldPath)) return;
 					this.markRecentlyModified(file.path);
+					// Obsidian's "New Folder" flow creates it under a default name and immediately
+					// renames it - the placeholder write from the create event targets the original
+					// name, so give the folder's final name a chance at one too if it's still empty.
+					if (file instanceof TFolder) void this.createFolderPlaceholder(file.path);
 					this.scheduleQuickSync();
 				}),
 			);
@@ -568,17 +572,36 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		const paths = [...files];
 		for (const folder of folders) {
 			if (!shouldTraverseIntoFolder(folder)) continue;
-			paths.push(...(await this.listAllFilePaths(folder)));
+			try {
+				paths.push(...(await this.listAllFilePaths(folder)));
+			} catch (error) {
+				// This subfolder was deleted between being listed just above and being recursed
+				// into - same "scan takes time" race as the vanished-file case in
+				// computeLocalShas. Nothing left there to include; move on to the next sibling
+				// instead of failing this entire scan over it.
+				console.error("[github-rest-sync] skipping vanished folder during scan", folder, error);
+			}
 		}
 		return paths;
 	}
 
 	private async computeLocalShas(): Promise<Map<string, string>> {
 		const result = new Map<string, string>();
+		// listAllFilePaths walks every folder before this loop reads a single byte - for a large
+		// vault that's real wall-clock time, during which a file seen by the scan can be deleted
+		// (a quick create-then-delete) before its turn comes up here. readBinary then throws ENOENT
+		// and crashed the whole sync cycle over one already-gone file. Treat it as simply absent -
+		// exactly what it now is - instead of failing the entire scan over it.
 		const paths = await this.listAllFilePaths();
 		for (const path of paths) {
 			if (isExcluded(path)) continue;
-			const bytes = await this.app.vault.adapter.readBinary(path);
+			let bytes: ArrayBuffer;
+			try {
+				bytes = await this.app.vault.adapter.readBinary(path);
+			} catch (error) {
+				console.error("[github-rest-sync] skipping vanished file during scan", path, error);
+				continue;
+			}
 			result.set(path, await gitBlobSha1(bytes));
 		}
 		return result;
@@ -757,7 +780,18 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	private async createFolderPlaceholder(folderPath: string): Promise<void> {
 		const path = `${folderPath}/${FOLDER_PLACEHOLDER_FILENAME}`;
 		try {
-			if (await this.app.vault.adapter.exists(path)) return;
+			// The folder may already be gone or renamed away by the time this runs - Obsidian's own
+			// "New Folder" flow creates it under a default name and immediately drops the user into
+			// renaming it, and this write is fired without awaiting on the create event, so a fast
+			// rename can land first. Writing anyway would resurrect a folder at the stale path, since
+			// the adapter implicitly creates any missing parent directory for a write.
+			const stat = await this.app.vault.adapter.stat(folderPath);
+			if (!stat || stat.type !== "folder") return;
+			// Also covers "placeholder already exists" (it would show up in files) without a
+			// separate exists() check, and skips folders that already have real content (e.g. a
+			// rename on a long-populated folder) so this stays safe to call from any folder event.
+			const { files, folders } = await this.app.vault.adapter.list(folderPath);
+			if (files.length > 0 || folders.length > 0) return;
 			await this.app.vault.adapter.write(path, FOLDER_PLACEHOLDER_CONTENT);
 		} catch (error) {
 			console.error("[github-rest-sync] failed to create folder placeholder", folderPath, error);
