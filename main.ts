@@ -101,6 +101,12 @@ const MAX_SYNC_INTERVAL_MINUTES = 1440;
 // recentlyModified above).
 const QUICK_SYNC_DEBOUNCE_MS = 3000;
 
+// Separate, much longer grace period before an empty folder becomes eligible for the proactive
+// prune sweep. QUICK_SYNC_DEBOUNCE_MS is tuned for "did typing pause" (seconds); a folder just
+// created empty needs real time before anything ends up in it - creating a folder and adding its
+// first note are usually two distinct actions, seconds to minutes apart, not one continuous edit.
+const EMPTY_FOLDER_PRUNE_GRACE_MS = 10 * 60 * 1000;
+
 // Safety-valve ceiling only - the guard normally clears itself the moment a diff observes local
 // and remote finally agree (see the local === remote branch below), however long that actually
 // takes. This just bounds the worst case (a push that silently never landed) so a stuck guard
@@ -760,9 +766,10 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		if (dir !== "" && isExcluded(`${dir}/`)) return false;
 		// A folder the user just created (still empty because they haven't put anything in it yet)
 		// looks identical to an old abandoned one - without this check, this sweep would delete it
-		// out from under them a few seconds after creation. Same settle window as everything else;
-		// left alone entirely this cycle, reconsidered once it's no longer "recent".
-		if (dir !== "" && this.isRecentlyModified(dir)) return false;
+		// out from under them. Uses the longer EMPTY_FOLDER_PRUNE_GRACE_MS, not the few-second
+		// settle window everything else uses: creating a folder and adding its first note are
+		// normally two separate actions, not one continuous edit, so a few seconds isn't enough.
+		if (dir !== "" && this.wasTouchedWithin(dir, EMPTY_FOLDER_PRUNE_GRACE_MS)) return false;
 		let files: string[];
 		let folders: string[];
 		try {
@@ -1222,9 +1229,13 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		this.recentlyModified.set(path, Date.now());
 	}
 
-	private isRecentlyModified(path: string): boolean {
+	private wasTouchedWithin(path: string, windowMs: number): boolean {
 		const at = this.recentlyModified.get(path);
-		return at !== undefined && Date.now() - at < QUICK_SYNC_DEBOUNCE_MS;
+		return at !== undefined && Date.now() - at < windowMs;
+	}
+
+	private isRecentlyModified(path: string): boolean {
+		return this.wasTouchedWithin(path, QUICK_SYNC_DEBOUNCE_MS);
 	}
 
 	private markRecentlyPushed(path: string, action: ChangeAction) {
