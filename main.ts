@@ -131,15 +131,6 @@ function looksLikeGithubToken(token: string): boolean {
 
 const REPORT_FILE_PATH = normalizePath("GitHub REST Sync Report.md");
 
-// Written into every newly created folder - see createFolderPlaceholder. Dot-prefixed like git's
-// own .gitkeep convention, so Obsidian's file explorer hides it the same way it hides .obsidian -
-// which needs a deliberate carve-out in isExcluded below (a dot-prefixed name is normally excluded
-// from the sync entirely), otherwise it would never actually sync and the folder would still look
-// empty - and therefore still prunable - to every other device.
-const FOLDER_PLACEHOLDER_FILENAME = ".folderKeep";
-const FOLDER_PLACEHOLDER_CONTENT =
-	"此檔案讓這個資料夾在同步時不會被當成空的清掉。放入其他檔案後可以直接刪除這個檔案。\n";
-
 // Files that get regenerated with different content on every run: excluded from the diff,
 // otherwise they'd permanently show up as "content differs".
 const EXCLUDED_PATHS = [REPORT_FILE_PATH];
@@ -201,13 +192,6 @@ function isExcluded(path: string): boolean {
 	if (EXCLUDED_PATHS.includes(path)) return true;
 	if (isAllowedPluginSyncFile(path)) return false;
 	const parts = path.split("/");
-	if (parts[parts.length - 1] === FOLDER_PLACEHOLDER_FILENAME) {
-		// Only the filename itself is exempt from the dot-prefix rule - the folders containing it
-		// still go through the normal check, so this never un-excludes anything actually inside
-		// .obsidian/.git/.trash/etc (createFolderPlaceholder is never even called for a folder
-		// there in the first place, but this keeps the exemption narrowly scoped regardless).
-		return parts.slice(0, -1).some((segment) => segment.startsWith("."));
-	}
 	return parts.some((segment) => segment.startsWith("."));
 }
 
@@ -379,11 +363,15 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 					if (isExcluded(file.path)) return;
 					this.markRecentlyModified(file.path);
 					// Git has no concept of an empty folder at all - it can only ever exist because
-					// some file's path happens to be inside it. Rather than guess whether a
-					// currently-empty folder is "new" or "abandoned", give every new folder real
-					// content the instant it's created, so it's never ambiguously empty in the first
-					// place and needs no special-casing anywhere else in the sync.
-					if (file instanceof TFolder) void this.createFolderPlaceholder(file.path);
+					// some file's path happens to be inside it. Rather than try to keep an empty
+					// folder alive across a sync (which previously meant writing a placeholder file
+					// into it the instant it's created - a write that raced against Obsidian's own
+					// "New Folder" flow immediately dropping the user into renaming it, sometimes
+					// corrupting Obsidian's file index), just don't sync at all on folder creation.
+					// An empty folder has nothing for git to represent anyway - it starts existing
+					// for sync purposes the moment a real file is added inside it, which fires its
+					// own create event and syncs normally.
+					if (file instanceof TFolder) return;
 					this.scheduleQuickSync();
 				}),
 			);
@@ -414,10 +402,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				this.app.vault.on("rename", (file, oldPath) => {
 					if (isExcluded(file.path) && isExcluded(oldPath)) return;
 					this.markRecentlyModified(file.path);
-					// Obsidian's "New Folder" flow creates it under a default name and immediately
-					// renames it - the placeholder write from the create event targets the original
-					// name, so give the folder's final name a chance at one too if it's still empty.
-					if (file instanceof TFolder) void this.createFolderPlaceholder(file.path);
 					this.scheduleQuickSync();
 				}),
 			);
@@ -771,30 +755,6 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		if (!folderPath) return;
 		if (!(await this.app.vault.adapter.exists(folderPath))) {
 			await this.app.vault.adapter.mkdir(folderPath);
-		}
-	}
-
-	// Called right when Obsidian tells us a folder was created. Best-effort: if this fails for any
-	// reason, the folder just stays genuinely empty and falls back to the normal (settle-window
-	// protected) judgment everywhere else in the sync - never worth breaking the sync over.
-	private async createFolderPlaceholder(folderPath: string): Promise<void> {
-		const path = `${folderPath}/${FOLDER_PLACEHOLDER_FILENAME}`;
-		try {
-			// The folder may already be gone or renamed away by the time this runs - Obsidian's own
-			// "New Folder" flow creates it under a default name and immediately drops the user into
-			// renaming it, and this write is fired without awaiting on the create event, so a fast
-			// rename can land first. Writing anyway would resurrect a folder at the stale path, since
-			// the adapter implicitly creates any missing parent directory for a write.
-			const stat = await this.app.vault.adapter.stat(folderPath);
-			if (!stat || stat.type !== "folder") return;
-			// Also covers "placeholder already exists" (it would show up in files) without a
-			// separate exists() check, and skips folders that already have real content (e.g. a
-			// rename on a long-populated folder) so this stays safe to call from any folder event.
-			const { files, folders } = await this.app.vault.adapter.list(folderPath);
-			if (files.length > 0 || folders.length > 0) return;
-			await this.app.vault.adapter.write(path, FOLDER_PLACEHOLDER_CONTENT);
-		} catch (error) {
-			console.error("[github-rest-sync] failed to create folder placeholder", folderPath, error);
 		}
 	}
 
