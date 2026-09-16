@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl, normalizePath } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFolder, requestUrl, normalizePath } from "obsidian";
 
 const SPINNER_STYLE_ID = "multi-device-sync-spinner-style";
 
@@ -130,6 +130,14 @@ function looksLikeGithubToken(token: string): boolean {
 }
 
 const REPORT_FILE_PATH = normalizePath("GitHub REST Sync Report.md");
+
+// Written into every newly created folder - see createFolderPlaceholder. Deliberately not
+// dot-prefixed (unlike git's own .gitkeep convention): a dot-prefixed name would be excluded from
+// the sync entirely (see isExcluded below), which would defeat the point - the folder needs to
+// actually sync as real content for other devices to keep it too.
+const FOLDER_PLACEHOLDER_FILENAME = "_keep.md";
+const FOLDER_PLACEHOLDER_CONTENT =
+	"此檔案讓這個資料夾在同步時不會被當成空的清掉。放入其他檔案後可以直接刪除這個檔案。\n";
 
 // Files that get regenerated with different content on every run: excluded from the diff,
 // otherwise they'd permanently show up as "content differs".
@@ -361,6 +369,12 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 				this.app.vault.on("create", (file) => {
 					if (isExcluded(file.path)) return;
 					this.markRecentlyModified(file.path);
+					// Git has no concept of an empty folder at all - it can only ever exist because
+					// some file's path happens to be inside it. Rather than guess whether a
+					// currently-empty folder is "new" or "abandoned", give every new folder real
+					// content the instant it's created, so it's never ambiguously empty in the first
+					// place and needs no special-casing anywhere else in the sync.
+					if (file instanceof TFolder) void this.createFolderPlaceholder(file.path);
 					this.scheduleQuickSync();
 				}),
 			);
@@ -725,6 +739,19 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		if (!folderPath) return;
 		if (!(await this.app.vault.adapter.exists(folderPath))) {
 			await this.app.vault.adapter.mkdir(folderPath);
+		}
+	}
+
+	// Called right when Obsidian tells us a folder was created. Best-effort: if this fails for any
+	// reason, the folder just stays genuinely empty and falls back to the normal (settle-window
+	// protected) judgment everywhere else in the sync - never worth breaking the sync over.
+	private async createFolderPlaceholder(folderPath: string): Promise<void> {
+		const path = `${folderPath}/${FOLDER_PLACEHOLDER_FILENAME}`;
+		try {
+			if (await this.app.vault.adapter.exists(path)) return;
+			await this.app.vault.adapter.write(path, FOLDER_PLACEHOLDER_CONTENT);
+		} catch (error) {
+			console.error("[github-rest-sync] failed to create folder placeholder", folderPath, error);
 		}
 	}
 
