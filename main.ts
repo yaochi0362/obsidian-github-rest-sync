@@ -750,6 +750,54 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		}
 	}
 
+	// pruneEmptyFoldersUpward only fires reactively, off a delete this device just made - it can't
+	// retroactively clean up a folder that was already empty before that code existed (e.g. from
+	// deletes another device made, or from before this feature shipped at all). This walks the
+	// whole vault proactively instead, bottom-up, removing every folder left with nothing in it
+	// (recursing first so a folder that only contains other now-empty folders gets removed too).
+	// Returns true if `dir` itself ended up empty and was removed, so the caller (its parent) knows.
+	//
+	// Reinstated deliberately at the 3-second settle window (not the 10-minute grace period tried
+	// and reverted, and not the fully-reactive-only design tried after that) - an interim choice
+	// pending a proper deletion-tombstone redesign to solve the multi-device coordination problem
+	// this sweep exists for.
+	private async pruneAllEmptyFolders(dir = ""): Promise<boolean> {
+		if (dir !== "" && isExcluded(`${dir}/`)) return false;
+		// A folder the user just created (still empty because they haven't put anything in it yet)
+		// looks identical to an old abandoned one - without this check, this sweep would delete it
+		// out from under them a few seconds after creation. Same settle window as everything else;
+		// left alone entirely this cycle, reconsidered once it's no longer "recent".
+		if (dir !== "" && this.isRecentlyModified(dir)) return false;
+		let files: string[];
+		let folders: string[];
+		try {
+			({ files, folders } = await this.app.vault.adapter.list(dir));
+		} catch (error) {
+			// Can't read it (permissions, or it vanished between listing and now) - leave it alone
+			// rather than letting one unreadable folder abort the whole vault-wide sweep.
+			console.error("[github-rest-sync] failed to list folder while pruning", dir, error);
+			return false;
+		}
+		let allSubfoldersRemoved = true;
+		for (const folder of folders) {
+			const removed = await this.pruneAllEmptyFolders(folder);
+			if (!removed) allSubfoldersRemoved = false;
+		}
+		// A stray junk file (.DS_Store and the like) doesn't count as real content - it already
+		// wouldn't be synced, so a folder containing only that is still "empty" for this purpose.
+		const realFiles = files.filter((file) => !isExcluded(file));
+		if (dir === "" || realFiles.length > 0 || !allSubfoldersRemoved) return false;
+		try {
+			// recursive: true also clears out any such junk files, which a plain (non-recursive)
+			// rmdir would otherwise refuse to remove.
+			await this.app.vault.adapter.rmdir(dir, true);
+		} catch (error) {
+			console.error("[github-rest-sync] failed to remove empty folder", dir, error);
+			return false;
+		}
+		return true;
+	}
+
 	private repoApiBase(): string {
 		const parsed = parseGithubRepoUrl(this.settings.repoUrl);
 		if (!parsed) throw new Error("Could not parse the repository URL");
@@ -1076,6 +1124,7 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 		onProgress: (msg: string) => void = () => {},
 	): Promise<{ pushed: number; pulled: number; pullFailed: number; conflicts: string[]; skippedPush: number }> {
 		onProgress("Comparing…");
+		await this.pruneAllEmptyFolders();
 		const { remoteTree, localShas, result } = await this.computeDiffNow();
 
 		const isFirstSync = !this.settings.firstSyncDone;
