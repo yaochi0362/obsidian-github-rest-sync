@@ -131,11 +131,12 @@ function looksLikeGithubToken(token: string): boolean {
 
 const REPORT_FILE_PATH = normalizePath("GitHub REST Sync Report.md");
 
-// Written into every newly created folder - see createFolderPlaceholder. Deliberately not
-// dot-prefixed (unlike git's own .gitkeep convention): a dot-prefixed name would be excluded from
-// the sync entirely (see isExcluded below), which would defeat the point - the folder needs to
-// actually sync as real content for other devices to keep it too.
-const FOLDER_PLACEHOLDER_FILENAME = "_keep.md";
+// Written into every newly created folder - see createFolderPlaceholder. Dot-prefixed like git's
+// own .gitkeep convention, so Obsidian's file explorer hides it the same way it hides .obsidian -
+// which needs a deliberate carve-out in isExcluded below (a dot-prefixed name is normally excluded
+// from the sync entirely), otherwise it would never actually sync and the folder would still look
+// empty - and therefore still prunable - to every other device.
+const FOLDER_PLACEHOLDER_FILENAME = ".folderKeep";
 const FOLDER_PLACEHOLDER_CONTENT =
 	"此檔案讓這個資料夾在同步時不會被當成空的清掉。放入其他檔案後可以直接刪除這個檔案。\n";
 
@@ -199,7 +200,15 @@ function isAllowedPluginSyncFile(path: string): boolean {
 function isExcluded(path: string): boolean {
 	if (EXCLUDED_PATHS.includes(path)) return true;
 	if (isAllowedPluginSyncFile(path)) return false;
-	return path.split("/").some((segment) => segment.startsWith("."));
+	const parts = path.split("/");
+	if (parts[parts.length - 1] === FOLDER_PLACEHOLDER_FILENAME) {
+		// Only the filename itself is exempt from the dot-prefix rule - the folders containing it
+		// still go through the normal check, so this never un-excludes anything actually inside
+		// .obsidian/.git/.trash/etc (createFolderPlaceholder is never even called for a folder
+		// there in the first place, but this keeps the exemption narrowly scoped regardless).
+		return parts.slice(0, -1).some((segment) => segment.startsWith("."));
+	}
+	return parts.some((segment) => segment.startsWith("."));
 }
 
 // Whether the local-file walk should descend into this folder at all. Mirrors isExcluded's normal
