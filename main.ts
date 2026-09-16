@@ -758,6 +758,11 @@ export default class MultiDeviceSyncPlugin extends Plugin {
 	// Returns true if `dir` itself ended up empty and was removed, so the caller (its parent) knows.
 	private async pruneAllEmptyFolders(dir = ""): Promise<boolean> {
 		if (dir !== "" && isExcluded(`${dir}/`)) return false;
+		// A folder the user just created (still empty because they haven't put anything in it yet)
+		// looks identical to an old abandoned one - without this check, this sweep would delete it
+		// out from under them a few seconds after creation. Same settle window as everything else;
+		// left alone entirely this cycle, reconsidered once it's no longer "recent".
+		if (dir !== "" && this.isRecentlyModified(dir)) return false;
 		let files: string[];
 		let folders: string[];
 		try {
